@@ -8,6 +8,7 @@ services:
       - ${BITTENSOR_WALLET_DIR:-/root/.bittensor}:/root/.bittensor:ro
       - node-volumes:/tmp/greenference-node-volumes
       - node-artifacts:/tmp/greenference-node-artifacts
+      - ${HF_HOME:-/root/.cache/huggingface}:/root/.cache/huggingface
     environment:
       GREENFERENCE_ENABLE_BACKGROUND_WORKERS: "true"
       GREENFERENCE_WORKER_POLL_INTERVAL_SECONDS: "${WORKER_POLL_INTERVAL_SECONDS:-1.0}"
@@ -34,7 +35,10 @@ services:
       # Backends
       GREENFERENCE_POD_BACKEND: "${GREENFERENCE_POD_BACKEND:-process}"
       GREENFERENCE_VM_BACKEND: "${GREENFERENCE_VM_BACKEND:-stub}"
-      GREENFERENCE_INFERENCE_BACKEND: "${GREENFERENCE_INFERENCE_BACKEND:-process}"
+      GREENFERENCE_INFERENCE_BACKEND: "${GREENFERENCE_INFERENCE_BACKEND:-docker}"
+      # HuggingFace (for vLLM model downloads)
+      HF_TOKEN: "${HF_TOKEN:-}"
+      HF_HOME: "${HF_HOME:-/root/.cache/huggingface}"
       # Security
       GREENFERENCE_SECURITY_TIER: "${GREENFERENCE_SECURITY_TIER:-standard}"
       GREENFERENCE_ATTESTATION_ENABLED: "${GREENFERENCE_ATTESTATION_ENABLED:-false}"
