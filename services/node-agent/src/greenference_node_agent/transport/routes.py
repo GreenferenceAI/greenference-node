@@ -167,6 +167,14 @@ def terminate_deployment(
     return _svc().terminate_deployment(deployment_id)
 
 
+@router.get("/agent/v1/gpu-status")
+def gpu_status(
+    x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
+) -> dict:
+    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
+    return _svc().gpu_allocator.status()
+
+
 @router.get("/agent/v1/fleet")
 def fleet_status(
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),

@@ -490,10 +490,17 @@ class DockerInferenceBackend(InferenceBackend):
         cmd: list[str] = [
             "docker", "run", "-d",
             "--name", container_name,
-            "--gpus", "all",
             "--shm-size", "8g",
             "-p", f"{port}:8000",
         ]
+
+        # GPU allocation — use specific devices if assigned, otherwise all
+        gpu_devices: list[int] | None = runtime.metadata.get("gpu_devices")
+        if gpu_devices:
+            device_str = ",".join(str(d) for d in gpu_devices)
+            cmd += ["--gpus", f'"device={device_str}"']
+        else:
+            cmd += ["--gpus", "all"]
 
         # Pass HuggingFace token if available
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN", "")

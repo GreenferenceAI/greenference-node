@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import socket
 import subprocess
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from math import floor
@@ -77,8 +79,12 @@ class ProcessPodBackend(PodBackend):
         if runtime.volume_path:
             cmd += ["-v", f"{runtime.volume_path}:/workspace"]
 
-        # GPU allocation
-        if runtime.gpu_fraction > 0:
+        # GPU allocation — use specific devices if assigned, otherwise all
+        gpu_devices: list[int] | None = runtime.metadata.get("gpu_devices")
+        if gpu_devices:
+            device_str = ",".join(str(d) for d in gpu_devices)
+            cmd += ["--gpus", f'"device={device_str}"']
+        elif runtime.gpu_fraction > 0:
             cmd += ["--gpus", "all"]
 
         # Environment variables
@@ -128,6 +134,25 @@ class ProcessPodBackend(PodBackend):
                 "updated_at": _utcnow(),
             }
         )
+
+    def wait_for_ready(
+        self,
+        runtime: UnifiedRuntimeRecord,
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> bool:
+        """Wait for the pod's SSH port to be reachable. Returns True if ready."""
+        if not runtime.ssh_port:
+            return True  # No SSH port, nothing to wait for
+        host = runtime.ssh_host or "127.0.0.1"
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            try:
+                with socket.create_connection((host, runtime.ssh_port), timeout=2.0):
+                    return True
+            except (ConnectionRefusedError, TimeoutError, OSError):
+                time.sleep(0.5)
+        return False
 
     def stop_pod(self, runtime: UnifiedRuntimeRecord) -> UnifiedRuntimeRecord:
         if runtime.container_id:

@@ -32,6 +32,7 @@ from greenference_node_agent.domain.inference import (
     ProcessInferenceBackend,
     StagedArtifactStore,
 )
+from greenference_node_agent.domain.gpu_allocator import GpuAllocationError, GpuAllocator
 from greenference_node_agent.domain.pod import PodError, ProcessPodBackend, StubPodBackend
 from greenference_node_agent.domain.ssh import SSHError, build_ssh_access, choose_free_port, generate_ssh_keypair
 from greenference_node_agent.domain.vm import FirecrackerVMBackend, StubVMBackend, VMError
@@ -82,6 +83,9 @@ class NodeAgentService:
             self.vm_backend: StubVMBackend | FirecrackerVMBackend = FirecrackerVMBackend()
         else:
             self.vm_backend = StubVMBackend()
+
+        # GPU device allocator
+        self.gpu_allocator = GpuAllocator(settings.gpu_count)
 
         # Track volume records for cleanup
         self._volume_records: dict[str, VolumeRecord] = {}
@@ -189,7 +193,21 @@ class NodeAgentService:
     def _start_inference_runtime(self, runtime: UnifiedRuntimeRecord, workload: WorkloadSpec) -> None:
         """Start an inference workload (model serving)."""
         model_id = workload.runtime.model_identifier if workload.runtime else workload.image
-        logger.info("starting inference runtime for %s (model: %s)", runtime.deployment_id, model_id)
+        gpu_count = workload.requirements.gpu_count if workload.requirements else 1
+        logger.info("starting inference runtime for %s (model: %s, gpus: %d)", runtime.deployment_id, model_id, gpu_count)
+
+        # Allocate specific GPU devices
+        try:
+            gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count)
+        except GpuAllocationError as exc:
+            logger.error("GPU allocation failed for %s: %s", runtime.deployment_id, exc)
+            self._fail_runtime(runtime, f"GPU allocation failed: {exc}")
+            return
+
+        runtime = runtime.model_copy(update={
+            "gpu_fraction": gpu_count,
+            "metadata": {**runtime.metadata, "gpu_devices": gpu_devices, "gpu_count": gpu_count},
+        })
 
         # Stage artifact
         build_id = workload.metadata.get("build_id", runtime.deployment_id)
@@ -275,8 +293,17 @@ class NodeAgentService:
             self._fail_runtime(runtime, "SSH setup failed")
             return
 
+        # Allocate specific GPU devices
+        gpu_count = workload.requirements.gpu_count if workload.requirements else 1
+        try:
+            gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count)
+        except GpuAllocationError as exc:
+            logger.error("GPU allocation failed for %s: %s", runtime.deployment_id, exc)
+            self._fail_runtime(runtime, f"GPU allocation failed: {exc}")
+            return
+
         # Create persistent volume
-        gpu_fraction = workload.requirements.gpu_count if workload.requirements else 1.0
+        gpu_fraction = gpu_count
         volume_size_gb = int(workload.metadata.get("volume_size_gb", 50))
         try:
             volume = self.volume_manager.create_volume(
@@ -315,6 +342,8 @@ class NodeAgentService:
                 "image": image,
                 "ssh_public_keys": [public_key],
                 "ssh_private_key": private_key,
+                "gpu_devices": gpu_devices,
+                "gpu_count": gpu_count,
             },
             "updated_at": _utcnow(),
         })
@@ -328,6 +357,11 @@ class NodeAgentService:
             self._fail_runtime(runtime, str(exc))
             return
 
+        # Wait for SSH to be reachable before marking ready
+        if hasattr(self.pod_backend, "wait_for_ready"):
+            if not self.pod_backend.wait_for_ready(runtime, timeout_seconds=30.0):
+                logger.warning("pod SSH not reachable for %s after 30s, marking ready anyway", runtime.deployment_id)
+
         runtime = runtime.model_copy(update={
             "endpoint": f"{s.miner_api_base_url}/deployments/{runtime.deployment_id}",
         })
@@ -336,10 +370,20 @@ class NodeAgentService:
 
     def _start_vm_runtime(self, runtime: UnifiedRuntimeRecord, workload: WorkloadSpec) -> None:
         """Start a VM workload (Firecracker/stub)."""
-        logger.info("starting VM runtime for %s", runtime.deployment_id)
+        gpu_count = workload.requirements.gpu_count if workload.requirements else 1
+        logger.info("starting VM runtime for %s (gpus: %d)", runtime.deployment_id, gpu_count)
+
+        try:
+            gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count)
+        except GpuAllocationError as exc:
+            logger.error("GPU allocation failed for %s: %s", runtime.deployment_id, exc)
+            self._fail_runtime(runtime, f"GPU allocation failed: {exc}")
+            return
+
         runtime = runtime.model_copy(update={
             "status": "starting",
             "current_stage": "start_vm",
+            "metadata": {**runtime.metadata, "gpu_devices": gpu_devices, "gpu_count": gpu_count},
         })
         self.repository.upsert_runtime(runtime)
 
@@ -392,6 +436,9 @@ class NodeAgentService:
             logger.exception("failed to report ready for %s", runtime.deployment_id)
 
     def _fail_runtime(self, runtime: UnifiedRuntimeRecord, error: str) -> None:
+        # Release GPU allocation on failure
+        self.gpu_allocator.release(runtime.deployment_id)
+
         runtime = runtime.model_copy(update={
             "status": "failed",
             "last_error": error,
@@ -409,6 +456,9 @@ class NodeAgentService:
             logger.exception("failed to report failure for %s", runtime.deployment_id)
 
     def _terminate_runtime(self, runtime: UnifiedRuntimeRecord, reason: str = "terminated") -> None:
+        # Release GPU allocation
+        self.gpu_allocator.release(runtime.deployment_id)
+
         # Stop the actual backend workload
         kind = runtime.workload_kind
         try:
