@@ -4,7 +4,7 @@ services:
     working_dir: /app/node
     volumes:
       - ./:/app/node
-      - ${PROTOCOL_DIR:-../../greenference/protocol}:/app/protocol
+      - ${PROTOCOL_DIR:-../greenference/protocol}:/app/protocol
       - /var/run/docker.sock:/var/run/docker.sock
       - ${BITTENSOR_WALLET_DIR:-~/.bittensor}:/root/.bittensor:ro
       - node-volumes:/tmp/greenference-node-volumes
