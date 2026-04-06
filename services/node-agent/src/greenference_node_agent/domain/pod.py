@@ -71,9 +71,9 @@ class ProcessPodBackend(PodBackend):
             "--restart", "unless-stopped",
         ]
 
-        # SSH port forwarding
+        # SSH port forwarding — let Docker pick a free host port to avoid races
         if runtime.ssh_port:
-            cmd += ["-p", f"{runtime.ssh_port}:22"]
+            cmd += ["-p", f"0.0.0.0::22"]
 
         # Volume mount
         if runtime.volume_path:
@@ -120,9 +120,29 @@ class ProcessPodBackend(PodBackend):
                 stage="start_pod",
             ) from exc
 
+        # Read back the actual host port Docker assigned
+        actual_ssh_port = runtime.ssh_port
+        if runtime.ssh_port:
+            try:
+                port_result = subprocess.run(  # noqa: S603
+                    ["docker", "port", container_id, "22"],  # noqa: S607
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                )
+                if port_result.returncode == 0 and port_result.stdout.strip():
+                    # output like "0.0.0.0:31234" or ":::31234"
+                    for line in port_result.stdout.strip().splitlines():
+                        if ":" in line:
+                            actual_ssh_port = int(line.rsplit(":", 1)[-1])
+                            break
+            except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+                pass
+
         return runtime.model_copy(
             update={
                 "container_id": container_id,
+                "ssh_port": actual_ssh_port,
                 "status": "ready",
                 "current_stage": "ready",
                 "metadata": {
