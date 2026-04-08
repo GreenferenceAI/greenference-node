@@ -148,6 +148,15 @@ async def chat_completions(
     return result.model_dump(mode="json") if hasattr(result, "model_dump") else result
 
 
+@router.get("/inference/{deployment_id}/healthz")
+def inference_healthz(deployment_id: str) -> dict:
+    """Health check for a specific inference runtime."""
+    runtime = _svc().repository.get_runtime(deployment_id)
+    if runtime is None or runtime.status != "ready" or not runtime.runtime_url:
+        raise HTTPException(status_code=503, detail="not ready")
+    return {"status": "ok", "deployment_id": deployment_id}
+
+
 @router.post("/inference/{deployment_id}/v1/chat/completions")
 async def inference_proxy(deployment_id: str, req: Request) -> StreamingResponse:
     """Proxy /v1/chat/completions to the runtime's vLLM container."""
