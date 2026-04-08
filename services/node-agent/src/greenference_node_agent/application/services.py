@@ -295,7 +295,7 @@ class NodeAgentService:
         runtime = runtime.model_copy(update={
             "status": "ready",
             "current_stage": "ready",
-            "endpoint": runtime.runtime_url or f"{self.settings.miner_api_base_url}/deployments/{runtime.deployment_id}",
+            "endpoint": f"{self.settings.miner_api_base_url}/inference/{runtime.deployment_id}",
             "updated_at": _utcnow(),
         })
         self.repository.upsert_runtime(runtime)

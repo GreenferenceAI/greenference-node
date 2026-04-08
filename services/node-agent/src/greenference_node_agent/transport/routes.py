@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib import request as urllib_request
+from urllib.error import HTTPError, URLError
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from greenference_protocol import (
     CapacityUpdate,
@@ -143,6 +146,35 @@ async def chat_completions(
     if result is None:
         raise HTTPException(status_code=404, detail="inference deployment not found or not ready")
     return result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+
+
+@router.post("/inference/{deployment_id}/v1/chat/completions")
+async def inference_proxy(deployment_id: str, req: Request) -> StreamingResponse:
+    """Proxy /v1/chat/completions to the runtime's vLLM container."""
+    runtime = _svc().repository.get_runtime(deployment_id)
+    if runtime is None or runtime.status != "ready" or not runtime.runtime_url:
+        raise HTTPException(status_code=404, detail="inference runtime not found or not ready")
+    body = await req.body()
+    upstream_url = f"{runtime.runtime_url}/v1/chat/completions"
+    upstream_req = urllib_request.Request(upstream_url, data=body, method="POST")
+    upstream_req.add_header("content-type", "application/json")
+    try:
+        resp = urllib_request.urlopen(upstream_req, timeout=120.0)  # noqa: S310
+    except (HTTPError, URLError, TimeoutError) as exc:
+        raise HTTPException(status_code=502, detail=f"upstream error: {exc}") from exc
+
+    def _stream():
+        try:
+            while True:
+                chunk = resp.read(4096)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            resp.close()
+
+    content_type = resp.headers.get("content-type", "application/json")
+    return StreamingResponse(_stream(), media_type=content_type)
 
 
 @router.get("/agent/v1/deployments/{deployment_id}/ssh")
