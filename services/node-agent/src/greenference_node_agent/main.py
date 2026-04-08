@@ -49,18 +49,29 @@ def _bootstrap() -> None:
     _worker_state["bootstrapped"] = True
 
 
-def _worker_tick() -> None:
-    """Synchronous worker tick — runs in a thread so it cannot block the event loop."""
-    if settings.bootstrap_miner and not _worker_state["bootstrapped"]:
-        logger.info("bootstrapping node agent...")
-        _bootstrap()
-        logger.info("bootstrap complete")
-    if settings.bootstrap_miner:
-        service.publish_heartbeat(Heartbeat(hotkey=settings.miner_hotkey, healthy=True))
-        capacity = service.build_capacity_update()
-        service.publish_capacity(capacity)
-        service.reconcile_once(settings.miner_hotkey)
+def _heartbeat_tick() -> None:
+    """Send heartbeat + capacity update. Must stay fast — no heavy I/O."""
+    service.publish_heartbeat(Heartbeat(hotkey=settings.miner_hotkey, healthy=True))
+    capacity = service.build_capacity_update()
+    service.publish_capacity(capacity)
+
+
+def _reconcile_tick() -> None:
+    """Reconcile workloads — may take minutes (docker pull, health checks)."""
+    service.reconcile_once(settings.miner_hotkey)
     _worker_state["last_iteration"] = datetime.now(UTC).isoformat()
+
+
+async def _heartbeat_loop() -> None:
+    """Dedicated heartbeat loop — keeps the miner alive regardless of reconciliation."""
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            if settings.bootstrap_miner and _worker_state["bootstrapped"]:
+                await loop.run_in_executor(None, _heartbeat_tick)
+        except Exception:
+            logger.exception("heartbeat loop error")
+        await asyncio.sleep(settings.worker_poll_interval_seconds)
 
 
 async def _worker_loop() -> None:
@@ -68,7 +79,10 @@ async def _worker_loop() -> None:
     loop = asyncio.get_running_loop()
     while True:
         try:
-            await loop.run_in_executor(None, _worker_tick)
+            if settings.bootstrap_miner and not _worker_state["bootstrapped"]:
+                await loop.run_in_executor(None, _bootstrap)
+            if settings.bootstrap_miner:
+                await loop.run_in_executor(None, _reconcile_tick)
         except Exception:
             logger.exception("worker loop error")
         await asyncio.sleep(settings.worker_poll_interval_seconds)
@@ -77,13 +91,14 @@ async def _worker_loop() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     set_service(service, settings)
-    task = None
+    tasks: list[asyncio.Task] = []
     if settings.enable_background_workers:
-        task = asyncio.create_task(_worker_loop())
+        tasks.append(asyncio.create_task(_worker_loop()))
+        tasks.append(asyncio.create_task(_heartbeat_loop()))
     try:
         yield
     finally:
-        if task is not None:
+        for task in tasks:
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
