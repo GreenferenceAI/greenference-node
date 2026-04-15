@@ -35,40 +35,11 @@ cd greenference-node
 
 ### configure
 
-Create `.env`:
-
-```env
-# Identity
-GREENFERENCE_MINER_HOTKEY=your-bittensor-hotkey
-GREENFERENCE_MINER_PAYOUT_ADDRESS=5F...your-payout-address
-GREENFERENCE_MINER_AUTH_SECRET=shared-secret-from-validator
-GREENFERENCE_MINER_NODE_ID=my-node-01
-
-# Network (point to validator)
-GREENFERENCE_CONTROL_PLANE_URL=http://VALIDATOR_IP:28001
-GREENFERENCE_MINER_VALIDATOR_URL=http://VALIDATOR_IP:28002
-GREENFERENCE_MINER_API_BASE_URL=http://YOUR_PUBLIC_IP:8007
-
-# Hardware (match your actual specs)
-GREENFERENCE_GPU_MODEL=rtx4090
-GREENFERENCE_GPU_COUNT=1
-GREENFERENCE_VRAM_GB_PER_GPU=24
-GREENFERENCE_CPU_CORES=16
-GREENFERENCE_MEMORY_GB=64
-
-# Backends
-GREENFERENCE_INFERENCE_BACKEND=docker
-GREENFERENCE_POD_BACKEND=process
-GREENFERENCE_SUPPORTED_WORKLOAD_KINDS=inference,pod
-
-# HuggingFace (for gated models like Llama)
-HF_TOKEN=hf_your_token_here
-
-# SSH for pod access
-GREENFERENCE_SSH_HOST=YOUR_PUBLIC_IP
-GREENFERENCE_SSH_PORT_RANGE_START=30000
-GREENFERENCE_SSH_PORT_RANGE_END=31000
+```bash
+cp .env.example .env
 ```
+
+Edit `.env` — fill in your validator IP, hotkey, hardware specs, and HF token. See `.env.example` for all options with comments.
 
 ### run
 
@@ -118,30 +89,19 @@ git pull
 docker compose restart
 ```
 
-## environment variables reference
+## environment variables
 
-| Variable | Default | Description |
-|---|---|---|
-| `GREENFERENCE_MINER_HOTKEY` | required | Bittensor hotkey |
-| `GREENFERENCE_CONTROL_PLANE_URL` | required | Control plane URL |
-| `GREENFERENCE_MINER_VALIDATOR_URL` | required | Validator URL |
-| `GREENFERENCE_MINER_API_BASE_URL` | `http://127.0.0.1:8007` | Self-advertised URL |
-| `GREENFERENCE_MINER_AUTH_SECRET` | required | Shared HMAC secret |
-| `GREENFERENCE_GPU_MODEL` | `rtx4090` | GPU model name |
-| `GREENFERENCE_GPU_COUNT` | `1` | Number of GPUs |
-| `GREENFERENCE_VRAM_GB_PER_GPU` | `24` | VRAM per GPU in GB |
-| `GREENFERENCE_CPU_CORES` | `32` | CPU cores |
-| `GREENFERENCE_MEMORY_GB` | `128` | System RAM in GB |
-| `GREENFERENCE_INFERENCE_BACKEND` | `docker` | `docker`, `process`, or `fallback` |
-| `GREENFERENCE_POD_BACKEND` | `process` | `process`, `stub`, or `k8s` |
-| `GREENFERENCE_VM_BACKEND` | `stub` | `stub` or `firecracker` |
-| `GREENFERENCE_SUPPORTED_WORKLOAD_KINDS` | `inference,pod,vm` | CSV of workload types |
-| `GREENFERENCE_AUTH_MODE` | `hmac` | `hmac` (dev) or `hotkey` (production) |
-| `GREENFERENCE_SECURITY_TIER` | auto-detect | `standard`, `cpu_tee`, `cpu_gpu_attested` |
-| `HF_TOKEN` | none | HuggingFace token for gated models |
-| `GREENFERENCE_SSH_HOST` | `0.0.0.0` | Public IP for pod SSH |
-| `GREENFERENCE_SSH_PORT_RANGE_START` | `30000` | SSH port pool start |
-| `GREENFERENCE_SSH_PORT_RANGE_END` | `31000` | SSH port pool end |
+See `.env.example` for the full list with comments. Key ones:
+
+| Variable | What to set |
+|---|---|
+| `GREENFERENCE_CONTROL_PLANE_URL` | Validator IP + port 28001 |
+| `GREENFERENCE_MINER_VALIDATOR_URL` | Validator IP + port 28002 |
+| `GREENFERENCE_MINER_HOTKEY` | Your Bittensor hotkey |
+| `GREENFERENCE_GPU_MODEL` / `GPU_COUNT` / `VRAM_GB_PER_GPU` | Your actual hardware |
+| `GREENFERENCE_INFERENCE_BACKEND` | `docker` (production) |
+| `HF_TOKEN` | HuggingFace token for gated models |
+| `GREENFERENCE_SSH_HOST` | Your public IP (for pod SSH) |
 
 ## directory structure
 
