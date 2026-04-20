@@ -77,6 +77,13 @@ class ProcessPodBackend(PodBackend):
             "--restart", "unless-stopped",
         ]
 
+        # Resource limits (proportional to GPU share, RunPod-style). Zero means
+        # "legacy unbounded" — skip the flag so existing workloads still work.
+        if runtime.cpu_cores_allocated and runtime.cpu_cores_allocated > 0:
+            cmd += ["--cpus", f"{runtime.cpu_cores_allocated:.2f}"]
+        if runtime.memory_gb_allocated and runtime.memory_gb_allocated > 0:
+            cmd += ["--memory", f"{runtime.memory_gb_allocated}g"]
+
         # SSH port forwarding — container always uses port 22 (injected sshd),
         # host port comes from the allocator (GREENFERENCE_SSH_PORT_RANGE_*).
         container_ssh_port = 22

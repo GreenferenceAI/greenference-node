@@ -388,11 +388,31 @@ class NodeAgentService:
             if tpl:
                 image = tpl.image
 
+        # Compute per-pod CPU + RAM allocation proportional to GPU share
+        # (RunPod-style: 1/N GPUs of host → 1/N of CPU and RAM). If the
+        # workload explicitly requests a smaller slice, honor that; otherwise
+        # cap at the fair share.
+        host_gpus = max(s.gpu_count, 1)
+        gpu_fraction_of_host = gpu_count / host_gpus
+        max_cpu = max(1.0, round(s.cpu_cores * gpu_fraction_of_host, 2))
+        max_mem_gb = max(1, int(s.memory_gb * gpu_fraction_of_host))
+        req_cpu = float(getattr(workload.requirements, "cpu_cores", 0) or 0) if workload.requirements else 0.0
+        req_mem = int(getattr(workload.requirements, "memory_gb", 0) or 0) if workload.requirements else 0
+        cpu_cores_allocated = min(max_cpu, req_cpu) if req_cpu > 0 else max_cpu
+        memory_gb_allocated = min(max_mem_gb, req_mem) if req_mem > 0 else max_mem_gb
+        logger.info(
+            "pod %s allocated: gpus=%d/%d cpu=%.2f cores (max %.2f) memory=%dGB (max %dGB)",
+            runtime.deployment_id, gpu_count, host_gpus,
+            cpu_cores_allocated, max_cpu, memory_gb_allocated, max_mem_gb,
+        )
+
         runtime = runtime.model_copy(update={
             "status": "starting",
             "current_stage": "start_pod",
             "template": template_name,
             "gpu_fraction": gpu_fraction,
+            "cpu_cores_allocated": cpu_cores_allocated,
+            "memory_gb_allocated": memory_gb_allocated,
             "ssh_host": s.ssh_host,
             "ssh_port": ssh_port,
             "ssh_username": "root",
