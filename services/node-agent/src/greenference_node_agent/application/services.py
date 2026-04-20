@@ -278,8 +278,31 @@ class NodeAgentService:
         image = workload.image or "unknown"
         artifact_uri = workload.metadata.get("artifact_uri", f"local://{image}")
         artifact_digest = workload.metadata.get("artifact_digest", f"sha256:{runtime.deployment_id[:16]}")
+
+        # Resolve runtime_kind from the most trustworthy source available.
+        # The gateway's build_*_workload helpers set this on
+        # `workload.runtime.runtime_kind` (pydantic field); legacy workloads
+        # may have it in `workload.metadata["runtime_kind"]`; as a last
+        # resort we fall back to image-name heuristics so a mislabeled
+        # deployment still goes down the right code path.
+        runtime_kind: str | None = None
+        if getattr(workload, "runtime", None) is not None:
+            rk = getattr(workload.runtime, "runtime_kind", None)
+            if rk:
+                runtime_kind = str(rk)
+        if not runtime_kind:
+            runtime_kind = workload.metadata.get("runtime_kind")
+        if not runtime_kind and image:
+            image_lower = image.lower()
+            if "diffusion" in image_lower:
+                runtime_kind = "diffusion"
+            elif "vllm" in image_lower:
+                runtime_kind = "vllm"
+        if not runtime_kind:
+            runtime_kind = "hf-causal-lm"
+
         runtime_manifest = {
-            "runtime_kind": workload.metadata.get("runtime_kind", "hf-causal-lm"),
+            "runtime_kind": runtime_kind,
             "model_identifier": model_id,
             "model_revision": workload.metadata.get("model_revision"),
             "tokenizer_identifier": workload.metadata.get("tokenizer_identifier"),
@@ -288,6 +311,10 @@ class NodeAgentService:
                 "miners keep deployments healthy with recovery failover and streaming completions",
             ]),
         }
+        logger.info(
+            "resolved runtime_kind=%s for %s (image=%s)",
+            runtime_kind, runtime.deployment_id, image,
+        )
         payload = {
             "build_id": build_id,
             "image": image,
