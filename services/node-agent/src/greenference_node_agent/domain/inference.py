@@ -558,15 +558,23 @@ class DockerInferenceBackend(InferenceBackend):
                 cmd += ["--tensor-parallel-size", str(tp_size)]
 
             # Max model length — caller can override via artifact payload; otherwise
-            # cap vision models at a conservative length to avoid OOM during KV-cache
-            # allocation (many VL models advertise 128k+ context by default).
+            # cap vision models at 32768 (Qwen2-VL / Llama-3.2-Vision native). Images
+            # are tokenized to 1280–1600 visual tokens each, plus conversation history,
+            # so 8k is too tight for multi-turn chat with uploaded images.
             max_model_len = artifact.payload.get("max_model_len")
-            if not max_model_len and self._looks_like_vision_model(model_id):
-                max_model_len = 8192
+            is_vision = self._looks_like_vision_model(model_id)
+            if not max_model_len and is_vision:
+                max_model_len = 32768
             if max_model_len:
                 cmd += ["--max-model-len", str(max_model_len)]
 
-            logger.info("starting vLLM container for %s: model=%s image=%s port=%d", runtime.deployment_id, model_id, image, port)
+            # Multimodal: cap per-prompt media counts so vLLM allocates the right
+            # number of image placeholders. Without this, some vLLM versions
+            # default to 0 and silently drop image inputs.
+            if is_vision:
+                cmd += ["--limit-mm-per-prompt", "image=4"]
+
+            logger.info("starting vLLM container for %s: model=%s image=%s port=%d vision=%s", runtime.deployment_id, model_id, image, port, is_vision)
 
         try:
             result = subprocess.run(  # noqa: S603
