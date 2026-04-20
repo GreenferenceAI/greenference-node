@@ -33,6 +33,7 @@ from greenference_node_agent.domain.inference import (
     StagedArtifactStore,
 )
 from greenference_node_agent.domain.gpu_allocator import GpuAllocationError, GpuAllocator
+from greenference_node_agent.domain.disk import detect_disk_mode
 from greenference_node_agent.domain.pod import PodError, ProcessPodBackend, StubPodBackend
 from greenference_node_agent.domain.ssh import SSHError, build_ssh_access, choose_free_port, generate_ssh_keypair, is_port_free
 from greenference_node_agent.domain.vm import FirecrackerVMBackend, StubVMBackend, VMError
@@ -61,12 +62,23 @@ class NodeAgentService:
             auth_mode=settings.auth_mode,
         )
 
+        # Disk enforcement — auto-detect the strongest mode this host supports.
+        # Operator can override via GREENFERENCE_DISK_ENFORCEMENT_MODE env var.
+        self.disk_mode = detect_disk_mode(settings.disk_enforcement_mode)
+        if self.disk_mode.value == "none":
+            logger.warning(
+                "disk quotas disabled — pod /workspace is unbounded; "
+                "run node-agent as root or set up sudoers/XFS-pquota to enforce"
+            )
+        else:
+            logger.info("disk enforcement mode: %s", self.disk_mode.value)
+
         # Pod backend
         if settings.pod_backend == "process":
-            self.pod_backend: ProcessPodBackend | StubPodBackend = ProcessPodBackend()
+            self.pod_backend: ProcessPodBackend | StubPodBackend = ProcessPodBackend(disk_mode=self.disk_mode)
         else:
             self.pod_backend = StubPodBackend()
-        self.volume_manager = LocalVolumeManager(settings.volume_base_dir)
+        self.volume_manager = LocalVolumeManager(settings.volume_base_dir, disk_mode=self.disk_mode)
 
         # Inference backend
         fallback = LocalArtifactInferenceBackend()

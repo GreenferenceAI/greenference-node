@@ -72,6 +72,10 @@ class Settings(BaseModel):
     user_port_range_start: int = Field(default=31001, ge=1024)
     user_port_range_end: int = Field(default=32000, ge=1025)
 
+    # Per-pod disk quota enforcement. None = auto-detect. Valid values:
+    # "loop_mount" | "loop_mount_sudo" | "storage_opt" | "none".
+    disk_enforcement_mode: str | None = None
+
     # Auth mode: "hotkey" (ed25519, production) or "hmac" (shared secret, dev)
     auth_mode: str = "hmac"
     # Bittensor wallet names for ed25519 signing (reads from ~/.bittensor/wallets/)
@@ -119,6 +123,7 @@ def load_settings() -> Settings:
         ssh_port_range_end=int(os.getenv("GREENFERENCE_SSH_PORT_RANGE_END", "31000")),
         user_port_range_start=int(os.getenv("GREENFERENCE_USER_PORT_RANGE_START", "31001")),
         user_port_range_end=int(os.getenv("GREENFERENCE_USER_PORT_RANGE_END", "32000")),
+        disk_enforcement_mode=os.getenv("GREENFERENCE_DISK_ENFORCEMENT_MODE") or None,
         auth_mode=os.getenv("GREENFERENCE_AUTH_MODE", "hmac"),
         coldkey_name=os.getenv("GREENFERENCE_COLDKEY_NAME") or None,
         hotkey_name=os.getenv("GREENFERENCE_HOTKEY_NAME", "default"),

@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
 import tarfile
 from datetime import UTC, datetime
 from pathlib import Path
 
 from greenference_protocol import VolumeRecord
+
+from greenference_node_agent.domain.disk import (
+    DiskError,
+    DiskMode,
+    create_loop_volume,
+    destroy_loop_volume,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -21,13 +31,24 @@ class VolumeError(RuntimeError):
 
 
 class LocalVolumeManager:
-    """Manages local directory-backed persistent volumes with tar.gz backup support."""
+    """Manages per-pod persistent volumes with optional loop-ext4 size enforcement.
 
-    def __init__(self, base_dir: str) -> None:
+    Mode behavior:
+      - LOOP_MOUNT / LOOP_MOUNT_SUDO: create a sparse ext4 image of `size_gb` and
+        loop-mount it at the volume path. Writes over the quota hit ENOSPC.
+      - STORAGE_OPT / NONE: fall back to plain mkdir (quota handled at docker
+        layer by pod.py, or unenforced).
+    """
+
+    def __init__(self, base_dir: str, *, disk_mode: DiskMode = DiskMode.NONE) -> None:
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.backup_dir = self.base_dir / ".backups"
         self.backup_dir.mkdir(parents=True, exist_ok=True)
+        self.disk_mode = disk_mode
+
+    def _image_path(self, deployment_id: str) -> Path:
+        return self.base_dir / f"{deployment_id}.ext4"
 
     def create_volume(
         self,
@@ -38,24 +59,47 @@ class LocalVolumeManager:
         size_gb: int,
         volume_id: str | None = None,
     ) -> VolumeRecord:
+        vol_path = self._volume_path(deployment_id)
         record = VolumeRecord(
             deployment_id=deployment_id,
             hotkey=hotkey,
             node_id=node_id,
-            path=str(self._volume_path(deployment_id)),
+            path=str(vol_path),
             size_gb=size_gb,
             status="created",
         )
         if volume_id:
             record = record.model_copy(update={"volume_id": volume_id})
-        vol_path = Path(record.path)
-        vol_path.mkdir(parents=True, exist_ok=True)
+
+        if self.disk_mode in (DiskMode.LOOP_MOUNT, DiskMode.LOOP_MOUNT_SUDO):
+            img_path = self._image_path(deployment_id)
+            try:
+                create_loop_volume(vol_path, img_path, size_gb, self.disk_mode)
+                logger.info(
+                    "loop-mounted volume %s at %s (size=%dGB mode=%s)",
+                    deployment_id, vol_path, size_gb, self.disk_mode.value,
+                )
+            except DiskError as exc:
+                raise VolumeError(str(exc), failure_class=exc.failure_class) from exc
+        else:
+            vol_path.mkdir(parents=True, exist_ok=True)
+
         return record
 
     def delete_volume(self, volume: VolumeRecord) -> None:
         vol_path = Path(volume.path)
-        if vol_path.exists():
-            shutil.rmtree(str(vol_path), ignore_errors=True)
+        if self.disk_mode in (DiskMode.LOOP_MOUNT, DiskMode.LOOP_MOUNT_SUDO):
+            img_path = self._image_path(volume.deployment_id)
+            destroy_loop_volume(vol_path, img_path, self.disk_mode)
+            # After umount the mount point may linger as an empty dir — clean it.
+            try:
+                vol_path.rmdir()
+            except OSError:
+                # Might not exist or not empty; best-effort.
+                pass
+        else:
+            if vol_path.exists():
+                shutil.rmtree(str(vol_path), ignore_errors=True)
 
     def backup_volume(self, volume: VolumeRecord) -> VolumeRecord:
         vol_path = Path(volume.path)

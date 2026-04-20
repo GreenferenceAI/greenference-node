@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from greenference_protocol import UnifiedRuntimeRecord, WorkloadSpec
+from greenference_node_agent.domain.disk import DiskMode
 from greenference_node_agent.domain.gpu_docker import gpu_docker_flags
 
 # Path to the SSH bootstrap entrypoint script (mounted into every pod container)
@@ -60,8 +61,10 @@ class ProcessPodBackend(PodBackend):
         self,
         *,
         backend_name: str = "process-pod-backend",
+        disk_mode: DiskMode = DiskMode.NONE,
     ) -> None:
         self.backend_name = backend_name
+        self.disk_mode = disk_mode
 
     def start_pod(
         self,
@@ -83,6 +86,11 @@ class ProcessPodBackend(PodBackend):
             cmd += ["--cpus", f"{runtime.cpu_cores_allocated:.2f}"]
         if runtime.memory_gb_allocated and runtime.memory_gb_allocated > 0:
             cmd += ["--memory", f"{runtime.memory_gb_allocated}g"]
+        # Disk quota — only meaningful in STORAGE_OPT mode (caps the container
+        # overlay). In LOOP_MOUNT modes the /workspace bind-mount is already
+        # a size-capped ext4 loop, so no extra flag is needed.
+        if self.disk_mode == DiskMode.STORAGE_OPT and runtime.volume_size_gb:
+            cmd += ["--storage-opt", f"size={runtime.volume_size_gb}G"]
 
         # SSH port forwarding — container always uses port 22 (injected sshd),
         # host port comes from the allocator (GREENFERENCE_SSH_PORT_RANGE_*).
