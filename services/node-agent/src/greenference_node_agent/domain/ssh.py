@@ -56,14 +56,60 @@ def _fingerprint_from_public_key(public_key_openssh: str) -> str:
     return f"SHA256:{hashlib.sha256(public_key_openssh.encode()).hexdigest()[:16]}"
 
 
+def _docker_bound_ports() -> set[int]:
+    """All host ports currently claimed by Docker containers.
+
+    Needed because Docker's iptables-NAT port publishing doesn't show up as a
+    listening socket on the host, so socket.bind() alone can succeed even
+    though `docker run -p <port>:...` will then fail with "port already
+    allocated". Calling this before returning a port avoids that race.
+    """
+    try:
+        result = subprocess.run(  # noqa: S603
+            ["docker", "ps", "--format", "{{.Ports}}"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return set()
+    if result.returncode != 0:
+        return set()
+    ports: set[int] = set()
+    for line in result.stdout.splitlines():
+        # Examples:
+        #   "0.0.0.0:30375->22/tcp, :::30375->22/tcp"
+        #   "0.0.0.0:31042->8080/tcp"
+        for chunk in line.split(","):
+            chunk = chunk.strip()
+            # pull the part before "->"
+            if "->" not in chunk:
+                continue
+            lhs = chunk.split("->", 1)[0]
+            # lhs looks like "0.0.0.0:30375" or ":::30375" or "30375"
+            tail = lhs.rsplit(":", 1)[-1]
+            try:
+                ports.add(int(tail))
+            except ValueError:
+                continue
+    return ports
+
+
 def choose_free_port(start: int = 30000, end: int = 31000) -> int:
-    """Pick a free port in [start, end)."""
+    """Pick a free port in [start, end).
+
+    Checks both kernel socket binding AND Docker's current port allocations
+    (see `_docker_bound_ports` for why both are required).
+    """
     tried: set[int] = set()
+    docker_used = _docker_bound_ports()
     while len(tried) < (end - start):
         port = secrets.randbelow(end - start) + start
         if port in tried:
             continue
         tried.add(port)
+        if port in docker_used:
+            continue
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             try:
                 sock.bind(("0.0.0.0", port))
@@ -74,7 +120,9 @@ def choose_free_port(start: int = 30000, end: int = 31000) -> int:
 
 
 def is_port_free(port: int) -> bool:
-    """Check if a specific host port can be bound on 0.0.0.0."""
+    """Check if a specific host port can be bound on 0.0.0.0 AND isn't held by Docker."""
+    if port in _docker_bound_ports():
+        return False
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         try:
             sock.bind(("0.0.0.0", port))
