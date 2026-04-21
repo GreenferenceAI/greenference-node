@@ -675,17 +675,29 @@ class DockerInferenceBackend(InferenceBackend):
         try:
             with request.urlopen(req, timeout=60.0) as resp:  # noqa: S310
                 data = json.loads(resp.read().decode())
-            # vLLM returns OpenAI-compatible response — extract content
+            # vLLM returns OpenAI-compatible response — extract content + usage
             content = ""
             choices = data.get("choices", [])
             if choices:
                 message = choices[0].get("message", {})
                 content = message.get("content", "")
+            # Preserve vLLM's `usage` block so the gateway can charge per-token.
+            # vLLM emits {"prompt_tokens": N, "completion_tokens": M, "total_tokens": K}.
+            usage_raw = data.get("usage") or {}
+            usage = None
+            if isinstance(usage_raw, dict):
+                from greenference_protocol import ChatCompletionUsage
+                usage = ChatCompletionUsage(
+                    prompt_tokens=int(usage_raw.get("prompt_tokens", 0) or 0),
+                    completion_tokens=int(usage_raw.get("completion_tokens", 0) or 0),
+                    total_tokens=int(usage_raw.get("total_tokens", 0) or 0),
+                )
             return ChatCompletionResponse(
                 model=data.get("model", payload.model),
                 content=content,
                 deployment_id=runtime.deployment_id,
                 routed_hotkey=runtime.hotkey,
+                usage=usage,
             )
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise InferenceRuntimeError(
@@ -708,6 +720,13 @@ class DockerInferenceBackend(InferenceBackend):
         target = f"{runtime.runtime_url}/v1/chat/completions"
         stream_payload = payload.model_dump(mode="json")
         stream_payload["stream"] = True
+        # Ask vLLM to emit a final usage chunk (OpenAI-style) so the gateway
+        # can meter streaming calls. Respects any user-supplied override.
+        existing_opts = stream_payload.get("stream_options")
+        if not isinstance(existing_opts, dict):
+            existing_opts = {}
+        existing_opts.setdefault("include_usage", True)
+        stream_payload["stream_options"] = existing_opts
         body = json.dumps(stream_payload).encode()
         req = request.Request(target, data=body, method="POST")
         req.add_header("content-type", "application/json")
