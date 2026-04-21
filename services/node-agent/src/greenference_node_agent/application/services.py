@@ -589,6 +589,7 @@ class NodeAgentService:
                 state=DeploymentState.READY,
                 endpoint=runtime.endpoint,
                 ssh_private_key=runtime.metadata.get("ssh_private_key"),
+                port_mappings=runtime.port_mappings or None,
                 ready_instances=1,
             ))
         except ControlPlaneHTTPError:
