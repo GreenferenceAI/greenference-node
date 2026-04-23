@@ -482,7 +482,9 @@ class DockerInferenceBackend(InferenceBackend):
         self.health_timeout_seconds = health_timeout_seconds
         self.default_image = default_image or os.environ.get(
             "GREENFERENCE_VLLM_IMAGE",
-            "vllm/vllm-openai:v0.7.3",
+            # v0.19.1 with CUDA 13.0 — Blackwell/sm_120 (RTX 5090) support
+            # + handles recent model archs that 0.7.3 lacks.
+            "vllm/vllm-openai:v0.19.1-cu130-ubuntu2404",
         )
         self.gpu_memory_utilization = gpu_memory_utilization
 
@@ -576,13 +578,14 @@ class DockerInferenceBackend(InferenceBackend):
                 cmd += ["--tensor-parallel-size", str(tp_size)]
 
             # Max model length — caller can override via artifact payload; otherwise
-            # cap vision models at 32768 (Qwen2-VL / Llama-3.2-Vision native). Images
-            # are tokenized to 1280–1600 visual tokens each, plus conversation history,
-            # so 8k is too tight for multi-turn chat with uploaded images.
+            # cap vision models at 16384 so KV cache fits on 24GB cards. Qwen2-VL
+            # at 32768 fails with "max seq len (32768) larger than KV cache" on
+            # RTX 4090/5090. 16k is a reasonable middle ground — fits multi-turn
+            # chat with 2-3 uploaded images per turn.
             max_model_len = artifact.payload.get("max_model_len")
             is_vision = self._looks_like_vision_model(model_id)
             if not max_model_len and is_vision:
-                max_model_len = 32768
+                max_model_len = 16384
             if max_model_len:
                 cmd += ["--max-model-len", str(max_model_len)]
 
