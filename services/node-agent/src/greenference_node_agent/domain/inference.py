@@ -592,8 +592,9 @@ class DockerInferenceBackend(InferenceBackend):
             # Multimodal: cap per-prompt media counts so vLLM allocates the right
             # number of image placeholders. Without this, some vLLM versions
             # default to 0 and silently drop image inputs.
+            # vLLM 0.x: "image=4", vLLM >=0.10 expects JSON: '{"image": 4}'.
             if is_vision:
-                cmd += ["--limit-mm-per-prompt", "image=4"]
+                cmd += ["--limit-mm-per-prompt", '{"image": 4}']
 
             logger.info("starting vLLM container for %s: model=%s image=%s port=%d vision=%s", runtime.deployment_id, model_id, image, port, is_vision)
 
