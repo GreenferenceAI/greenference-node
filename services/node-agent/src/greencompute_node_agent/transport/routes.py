@@ -185,8 +185,19 @@ def pod_stats(deployment_id: str) -> dict:
 
 
 @router.post("/inference/{deployment_id}/v1/chat/completions")
-async def inference_proxy(deployment_id: str, req: Request) -> StreamingResponse:
-    """Proxy /v1/chat/completions to the runtime's vLLM container."""
+async def inference_proxy(
+    deployment_id: str,
+    req: Request,
+    x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
+) -> StreamingResponse:
+    """Proxy /v1/chat/completions to the runtime's vLLM container.
+
+    Requires the same `X-Agent-Auth` header all other node-agent routes
+    expect. Without this check, anyone reachable on port 8007 (especially
+    over a public IP) could bypass the gateway's balance / rate-limit
+    enforcement and invoke models directly via the deployment_id.
+    """
+    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
     runtime = _svc().repository.get_runtime(deployment_id)
     if runtime is None or runtime.status != "ready" or not runtime.runtime_url:
         raise HTTPException(status_code=404, detail="inference runtime not found or not ready")
