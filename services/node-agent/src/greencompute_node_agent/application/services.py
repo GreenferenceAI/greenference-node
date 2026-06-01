@@ -180,8 +180,34 @@ class NodeAgentService:
 
     def reconcile_once(self, hotkey: str) -> None:
         """Main reconciliation loop: sync leases, dispatch workloads, cleanup orphans."""
-        leases = self.sync_leases(hotkey)
+        all_leases = self.sync_leases(hotkey)
+        # Multi-box-per-hotkey: the control-plane returns EVERY lease for the
+        # hotkey, but each lease is placed on a specific node_id. Without this
+        # filter, every box sharing the hotkey would run every deployment —
+        # duplicating work and leaking GPU capacity across the fleet. Only act
+        # on leases assigned to THIS box's node_id. A lease with no node_id is
+        # treated as ours (single-box / legacy back-compat) but logged so the
+        # gap is visible.
+        my_node = self.settings.node_id
+        leases = []
+        for lease in all_leases:
+            lease_node = getattr(lease, "node_id", None)
+            if lease_node and lease_node != my_node:
+                continue
+            if not lease_node:
+                logger.warning(
+                    "lease %s has no node_id — running on %s by back-compat; "
+                    "control-plane should pin it to a node",
+                    lease.deployment_id, my_node,
+                )
+            leases.append(lease)
         active_deployment_ids = {lease.deployment_id for lease in leases}
+        # Every lease for this hotkey across the WHOLE fleet, regardless of
+        # node_id. Used by orphan-cleanup to tell "this deployment's lease is
+        # gone everywhere" (safe to report TERMINATED) apart from "this is a
+        # duplicate we ran for another box — its lease is alive on that box"
+        # (tear down locally, but DON'T report or we'd kill the real pod).
+        fleet_deployment_ids = {lease.deployment_id for lease in all_leases}
 
         # Start new workloads from leases
         for lease in leases:
@@ -207,15 +233,29 @@ class NodeAgentService:
                 except Exception:
                     logger.exception("failed to report reconciliation failure for %s", lease.deployment_id)
 
-        # Terminate orphaned runtimes (no longer in active leases)
+        # Clean up runtimes that are no longer ours to run.
         for deployment_id, runtime in list(self.repository.runtimes.items()):
             if deployment_id in active_deployment_ids:
                 continue
             if runtime.status == "terminated":
                 continue
-            # Also clean up containers for failed runtimes whose lease is gone
-            logger.info("terminating orphaned runtime %s (status=%s)", deployment_id, runtime.status)
-            self._terminate_runtime(runtime, reason="lease_expired")
+            if deployment_id in fleet_deployment_ids:
+                # Lease still exists, just pinned to ANOTHER node_id. This box
+                # ran it as a duplicate (pre-filter back-compat). Reclaim our
+                # local GPUs/container but do NOT report TERMINATED — the
+                # deployment is alive and healthy on its real node, and a
+                # spurious report would mark it dead and tear down the tenant's
+                # actual pod on the other box.
+                logger.info(
+                    "shedding duplicate runtime %s (lease pinned to another node) "
+                    "— local teardown only, not reporting",
+                    deployment_id,
+                )
+                self._terminate_runtime(runtime, reason="foreign_node_duplicate", report=False)
+            else:
+                # Lease is gone fleet-wide → genuine orphan. Terminate + report.
+                logger.info("terminating orphaned runtime %s (status=%s)", deployment_id, runtime.status)
+                self._terminate_runtime(runtime, reason="lease_expired")
 
     def _reconcile_workload(self, lease: LeaseAssignment) -> None:
         """Dispatch a new lease to the appropriate runtime handler based on workload kind."""
@@ -630,7 +670,12 @@ class NodeAgentService:
         except ControlPlaneHTTPError:
             logger.exception("failed to report failure for %s", runtime.deployment_id)
 
-    def _terminate_runtime(self, runtime: UnifiedRuntimeRecord, reason: str = "terminated") -> None:
+    def _terminate_runtime(self, runtime: UnifiedRuntimeRecord, reason: str = "terminated", *, report: bool = True) -> None:
+        """Tear down a runtime locally. When `report` is False we DON'T tell the
+        control-plane it terminated — used for foreign-node duplicates (a lease
+        that belongs to another box but ran here): we want to free our local
+        GPUs/container without marking the real deployment (alive on its own
+        node) as dead."""
         # Release GPU allocation
         self.gpu_allocator.release(runtime.deployment_id)
 
@@ -659,13 +704,14 @@ class NodeAgentService:
             "updated_at": _utcnow(),
         })
         self.repository.upsert_runtime(runtime)
-        try:
-            self.control_plane.update_deployment_status(DeploymentStatusUpdate(
-                deployment_id=runtime.deployment_id,
-                state=DeploymentState.TERMINATED,
-            ))
-        except ControlPlaneHTTPError:
-            logger.exception("failed to report termination for %s", runtime.deployment_id)
+        if report:
+            try:
+                self.control_plane.update_deployment_status(DeploymentStatusUpdate(
+                    deployment_id=runtime.deployment_id,
+                    state=DeploymentState.TERMINATED,
+                ))
+            except ControlPlaneHTTPError:
+                logger.exception("failed to report termination for %s", runtime.deployment_id)
 
     def terminate_deployment(self, deployment_id: str) -> dict[str, Any]:
         runtime = self.repository.get_runtime(deployment_id)
