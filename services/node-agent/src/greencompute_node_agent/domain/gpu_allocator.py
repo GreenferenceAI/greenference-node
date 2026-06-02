@@ -67,6 +67,32 @@ class GpuAllocator:
         )
         return allocated
 
+    def allocate_specific(self, deployment_id: str, devices: list[int]) -> list[int]:
+        """Reserve EXACTLY these device indices for a deployment.
+
+        Used when RESUMING a pod (ORCH-H3): the pod's container is pinned to its
+        ORIGINAL `--gpus` devices, so it must come back on those same cards — not
+        an arbitrary free[:n] slice. Raises GpuAllocationError if any requested
+        device is in use by ANOTHER deployment (devices already attributed to
+        this deployment count as available to it, so it is idempotent).
+        """
+        want = {int(d) for d in devices}
+        if not want:
+            return []
+        available = self.free_devices | self._allocations.get(deployment_id, set())
+        if not want.issubset(available):
+            taken = sorted(want - available)
+            raise GpuAllocationError(
+                f"cannot reserve devices {sorted(want)} for {deployment_id}: "
+                f"{taken} already in use by another workload"
+            )
+        self._allocations[deployment_id] = want
+        logger.info(
+            "reserved specific GPUs %s for %s (%d/%d now used)",
+            sorted(want), deployment_id, self.used_count, self.total_gpus,
+        )
+        return sorted(want)
+
     def release(self, deployment_id: str) -> list[int]:
         """Release GPUs for a deployment. Returns the freed device IDs."""
         devices = self._allocations.pop(deployment_id, set())

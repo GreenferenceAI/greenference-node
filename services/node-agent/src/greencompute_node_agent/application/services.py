@@ -845,8 +845,19 @@ class NodeAgentService:
         Only ever called when a previously-suspended runtime's lease has returned
         to a non-suspended (active) status."""
         gpu_count = int(runtime.metadata.get("gpu_count", runtime.gpu_fraction or 1) or 1)
+        _is_pod = runtime.workload_kind in (WorkloadKind.POD, "pod")
+        _original_devices = runtime.metadata.get("gpu_devices") or []
         try:
-            gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count)
+            if _is_pod and _original_devices:
+                # A pod's container is pinned to its ORIGINAL --gpus devices, so it
+                # MUST resume on exactly those cards — not a fresh free[:n] slice,
+                # or the allocator's record would diverge from the container's
+                # reality. Stays suspended if those exact cards aren't free.
+                gpu_devices = self.gpu_allocator.allocate_specific(
+                    runtime.deployment_id, _original_devices
+                )
+            else:
+                gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count)
         except GpuAllocationError as exc:
             # No capacity to resume — leave it suspended; the control-plane will
             # retry. Do NOT fail/terminate (that would destroy the preserved pod).
