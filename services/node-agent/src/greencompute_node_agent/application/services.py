@@ -147,20 +147,25 @@ class NodeAgentService:
     def build_capacity_update(self) -> CapacityUpdate:
         """Build a CapacityUpdate reflecting current GPU availability."""
         s = self.settings
-        # Calculate available GPUs based on active runtimes
-        reserved_split_units = 0
+        # Derive available GPUs from the allocator's whole-device truth, NOT from
+        # the overloaded gpu_fraction field (which the node-agent populates with a
+        # whole device COUNT, not a 0..1 share — see _start_*_runtime). The
+        # allocator and metadata["gpu_devices"] both count whole devices, so this
+        # matches gpu_allocator.free_count exactly and is robust regardless of
+        # what gpu_fraction holds.
+        reserved_gpus = 0
         for rt in self.repository.runtimes.values():
             if rt.status in ("accepted", "preparing", "starting", "ready"):
-                reserved_split_units += int(rt.gpu_fraction * s.gpu_split_units)
-        total_units = s.gpu_count * s.gpu_split_units
-        available_fractional = max(0, (total_units - reserved_split_units)) / s.gpu_split_units
+                devices = rt.metadata.get("gpu_devices") or []
+                reserved_gpus += len(devices) or int(rt.metadata.get("gpu_count", 1) or 1)
+        available_gpus = max(0, s.gpu_count - reserved_gpus)
 
         node = NodeCapability(
             hotkey=s.miner_hotkey,
             node_id=s.node_id,
             gpu_model=s.gpu_model,
             gpu_count=s.gpu_count,
-            available_gpus=int(available_fractional),
+            available_gpus=available_gpus,
             vram_gb_per_gpu=s.vram_gb_per_gpu,
             cpu_cores=s.cpu_cores,
             memory_gb=s.memory_gb,
@@ -215,7 +220,18 @@ class NodeAgentService:
             if existing is not None:
                 # If the runtime was saved but never reached ready/failed, retry it
                 if existing.status in ("accepted", "starting"):
-                    logger.info("retrying stuck runtime %s (status=%s)", lease.deployment_id, existing.status)
+                    # Tear down locally FIRST (release GPUs + stop any launched
+                    # container) before remove+re-dispatch — otherwise the old
+                    # allocation/container leaks (the inf-8f1f5461 orphan). Use
+                    # report=False: the lease is still active and we're about to
+                    # re-create the runtime, so a TERMINATED report would race the
+                    # fresh record. A READY runtime never reaches this branch (it
+                    # hits the else: continue below), so healthy pods are untouched.
+                    logger.info(
+                        "retrying stuck runtime %s (status=%s) — local teardown then re-dispatch",
+                        lease.deployment_id, existing.status,
+                    )
+                    self._terminate_runtime(existing, reason="stuck_retry", report=False)
                     self.repository.remove_runtime(lease.deployment_id)
                 else:
                     continue  # Already completed (ready/failed/terminated)
@@ -722,23 +738,66 @@ class NodeAgentService:
 
     # --- Recovery ---
 
+    # Deployment states for which a persisted runtime should be KEPT (not torn
+    # down) at startup recovery. Keep-by-default: anything legitimately in
+    # flight (queued/pulling/starting), serving (ready), draining, or
+    # intentionally suspended must survive a node-agent restart. Only
+    # PENDING/FAILED/TERMINATED fall through to local teardown.
+    _RECOVERY_KEEP_STATES = frozenset({
+        DeploymentState.READY,
+        DeploymentState.STARTING,
+        DeploymentState.SCHEDULED,
+        DeploymentState.PULLING,
+        DeploymentState.DRAINING,
+        DeploymentState.SUSPENDED,
+    })
+
     def recover_runtime_state(self, hotkey: str) -> dict[str, Any]:
-        """On startup, check persisted runtimes and terminate stale ones."""
+        """On startup, check persisted runtimes and tear down only the ones the
+        control-plane confirms are gone/dead. Keep-by-default so a node-agent
+        restart never kills in-flight or running pods; a control-plane blip is
+        treated as "keep, reconcile later" rather than "terminate"."""
         resumed = 0
         terminated = 0
         for deployment_id, runtime in list(self.repository.runtimes.items()):
             if runtime.status in ("terminated", "failed"):
                 continue
-            # Check if deployment still exists on control plane
+            # Check if deployment still exists on control plane.
             try:
                 deployment = self.control_plane.get_deployment(deployment_id)
-                if deployment and deployment.state in (DeploymentState.READY, DeploymentState.STARTING):
-                    resumed += 1
-                    continue
             except ControlPlaneHTTPError:
-                pass
-            # Stale runtime — terminate
-            self._terminate_runtime(runtime, reason="stale_recovery")
+                # Control-plane unreachable — KEEP the runtime and reconcile
+                # later. A restart during a CP outage must NOT tear down live
+                # pods; reconcile_once is the authority for genuine orphans
+                # once the CP is reachable again.
+                logger.warning(
+                    "control-plane unreachable during recovery for %s — keeping runtime, will reconcile later",
+                    deployment_id,
+                )
+                resumed += 1
+                continue
+            if deployment is None:
+                # Explicit 404 → deployment is gone fleet-wide. Reclaim our
+                # local GPUs/container but DON'T report TERMINATED (reconcile_once
+                # is the authority for reporting), so we never spuriously mark a
+                # deployment dead.
+                logger.info(
+                    "deployment %s not found on control-plane during recovery — local teardown",
+                    deployment_id,
+                )
+                self._terminate_runtime(runtime, reason="recovery_missing", report=False)
+                terminated += 1
+                continue
+            if deployment.state in self._RECOVERY_KEEP_STATES:
+                resumed += 1
+                continue
+            # PENDING/FAILED/TERMINATED → tear down. Only report when the
+            # control-plane already considers it dead, so we don't fight it.
+            self._terminate_runtime(
+                runtime,
+                reason="stale_recovery",
+                report=deployment.state in (DeploymentState.TERMINATED, DeploymentState.FAILED),
+            )
             terminated += 1
 
         return {

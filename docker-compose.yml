@@ -88,8 +88,19 @@ services:
     # `docker run -p` for every subsequent rental.
     ports:
       - "8007:8007"
+    # The node-agent opens many fds (docker subprocess pipes per container op,
+    # HF cache, urllib sockets, JSON state). Under load the default container
+    # nofile limit can be exhausted -> docker run/inspect/logs failures that
+    # masquerade as deploy errors. Codifies the 5090 hand-fix.
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"from urllib.request import urlopen; urlopen('http://127.0.0.1:8007/readyz')\""]
+      # timeout=4 (< the compose timeout: 5s below) so urlopen errors cleanly
+      # if /readyz wedges, yielding a deterministic unhealthy mark instead of
+      # blocking until docker SIGKILLs the probe.
+      test: ["CMD-SHELL", "python -c \"from urllib.request import urlopen; urlopen('http://127.0.0.1:8007/readyz', timeout=4)\""]
       interval: 5s
       timeout: 5s
       retries: 20

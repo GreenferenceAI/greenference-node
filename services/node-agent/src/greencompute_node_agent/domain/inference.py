@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -521,6 +522,21 @@ def _auto_select_vllm_image() -> str:
     return _VLLM_CU130_IMAGE
 
 
+def _vllm_image_uses_json_mm_limit(image: str) -> bool:
+    """vLLM >=0.10 takes the JSON form for --limit-mm-per-prompt
+    (e.g. '{"image": 4}'); 0.x (the cu12 v0.8.5 image) only parses the
+    key=value form ('image=4') and crashes on JSON at arg-parse.
+
+    Default to JSON when the version isn't parseable — that matches our cu130
+    default and is safe for any current/newer build.
+    """
+    m = re.search(r"v?(\d+)\.(\d+)", image or "")
+    if not m:
+        return True
+    major, minor = int(m.group(1)), int(m.group(2))
+    return (major, minor) >= (0, 10)
+
+
 class DockerInferenceBackend(InferenceBackend):
     """Launches inference as a Docker container running vLLM or diffusion server."""
 
@@ -683,9 +699,12 @@ class DockerInferenceBackend(InferenceBackend):
             # Multimodal: cap per-prompt media counts so vLLM allocates the right
             # number of image placeholders. Without this, some vLLM versions
             # default to 0 and silently drop image inputs.
-            # vLLM 0.x: "image=4", vLLM >=0.10 expects JSON: '{"image": 4}'.
+            # vLLM 0.x (cu12 v0.8.5): "image=4"; vLLM >=0.10 (cu130): '{"image": 4}'.
             if is_vision:
-                cmd += ["--limit-mm-per-prompt", '{"image": 4}']
+                if _vllm_image_uses_json_mm_limit(image):
+                    cmd += ["--limit-mm-per-prompt", '{"image": 4}']
+                else:
+                    cmd += ["--limit-mm-per-prompt", "image=4"]
 
             logger.info("starting vLLM container for %s: model=%s image=%s port=%d vision=%s", runtime.deployment_id, model_id, image, port, is_vision)
 
@@ -906,8 +925,26 @@ class DockerInferenceBackend(InferenceBackend):
             except (HTTPError, URLError, TimeoutError) as exc:
                 last_error = str(exc)
             time.sleep(check_interval)
+        # Timeout with the container still running (the common slow-OOM / wedged
+        # -load case) — the exited-path logs grab above never fired, so the
+        # operator would otherwise get only a bare 'timed out'. Best-effort grab
+        # the tail so the failure report carries the real cause. Time-boxed and
+        # wrapped so it can never block or change control flow.
+        tail = ""
+        if runtime.container_id:
+            try:
+                logs = subprocess.run(  # noqa: S603
+                    ["docker", "logs", "--tail", "200", runtime.container_id],  # noqa: S607
+                    capture_output=True,
+                    text=True,
+                    timeout=10.0,
+                )
+                tail = ((logs.stdout or "") + (logs.stderr or "")).strip()
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
         raise InferenceRuntimeError(
-            f"vLLM health check timed out after {self.health_timeout_seconds}s: {last_error or 'no response'}",
+            f"vLLM health check timed out after {self.health_timeout_seconds}s: {last_error or 'no response'}"
+            + (f"\n--- container logs (tail 200) ---\n{tail}" if tail else ""),
             failure_class="health_check_failure",
             stage="health_check",
         )
