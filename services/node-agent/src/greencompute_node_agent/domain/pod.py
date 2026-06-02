@@ -44,6 +44,12 @@ class PodBackend:
     def stop_pod(self, runtime: UnifiedRuntimeRecord) -> UnifiedRuntimeRecord:
         raise NotImplementedError
 
+    def pause_pod(self, runtime: UnifiedRuntimeRecord) -> UnifiedRuntimeRecord:
+        raise NotImplementedError
+
+    def resume_pod(self, runtime: UnifiedRuntimeRecord) -> UnifiedRuntimeRecord:
+        raise NotImplementedError
+
     def health(self, runtime: UnifiedRuntimeRecord) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -271,6 +277,71 @@ class ProcessPodBackend(PodBackend):
             }
         )
 
+    def pause_pod(self, runtime: UnifiedRuntimeRecord) -> UnifiedRuntimeRecord:
+        """Suspend a pod by stopping its container WITHOUT removing it.
+
+        Pod-safe: uses `docker stop` (graceful SIGTERM, then SIGKILL) so the
+        container's filesystem, named volumes, SSH host keys and port mappings
+        are all preserved on disk. The container moves to the 'exited' state and
+        can be restarted in place via resume_pod. We deliberately keep
+        container_id so resume can `docker start` the SAME container.
+        NEVER `docker rm -f` here — that would destroy the tenant's pod state.
+        """
+        if runtime.container_id:
+            try:
+                subprocess.run(  # noqa: S603
+                    ["docker", "stop", runtime.container_id],  # noqa: S607
+                    capture_output=True,
+                    timeout=60.0,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+        return runtime.model_copy(
+            update={
+                "status": "suspended",
+                "current_stage": "suspended",
+                # container_id intentionally PRESERVED so resume can restart it.
+                "metadata": {**runtime.metadata, "suspended_at": _utcnow().isoformat()},
+                "updated_at": _utcnow(),
+            }
+        )
+
+    def resume_pod(self, runtime: UnifiedRuntimeRecord) -> UnifiedRuntimeRecord:
+        """Resume a previously-paused pod by starting the SAME container.
+
+        `docker start` re-launches the exited container with its original
+        filesystem, volumes, SSH keys, env and port bindings intact — no
+        destroy-and-recreate, no data loss.
+        """
+        if runtime.container_id:
+            try:
+                result = subprocess.run(  # noqa: S603
+                    ["docker", "start", runtime.container_id],  # noqa: S607
+                    capture_output=True,
+                    text=True,
+                    timeout=60.0,
+                )
+                if result.returncode != 0:
+                    raise PodError(
+                        f"docker start failed: {result.stderr}",
+                        failure_class="pod_resume_failure",
+                        stage="resume_pod",
+                    )
+            except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+                raise PodError(
+                    f"docker not available: {exc}",
+                    failure_class="pod_resume_failure",
+                    stage="resume_pod",
+                ) from exc
+        return runtime.model_copy(
+            update={
+                "status": "ready",
+                "current_stage": "ready",
+                "metadata": {**runtime.metadata, "resumed_at": _utcnow().isoformat()},
+                "updated_at": _utcnow(),
+            }
+        )
+
     def health(self, runtime: UnifiedRuntimeRecord) -> dict[str, Any]:
         if not runtime.container_id:
             return {"status": "not_started", "healthy": False}
@@ -360,6 +431,27 @@ class StubPodBackend(PodBackend):
                 "current_stage": "terminated",
                 "container_id": None,
                 "metadata": {**runtime.metadata, "terminated_at": _utcnow().isoformat()},
+                "updated_at": _utcnow(),
+            }
+        )
+
+    def pause_pod(self, runtime: UnifiedRuntimeRecord) -> UnifiedRuntimeRecord:
+        # Stub: preserve container_id (no real docker stop), just flip state.
+        return runtime.model_copy(
+            update={
+                "status": "suspended",
+                "current_stage": "suspended",
+                "metadata": {**runtime.metadata, "suspended_at": _utcnow().isoformat()},
+                "updated_at": _utcnow(),
+            }
+        )
+
+    def resume_pod(self, runtime: UnifiedRuntimeRecord) -> UnifiedRuntimeRecord:
+        return runtime.model_copy(
+            update={
+                "status": "ready",
+                "current_stage": "ready",
+                "metadata": {**runtime.metadata, "resumed_at": _utcnow().isoformat()},
                 "updated_at": _utcnow(),
             }
         )

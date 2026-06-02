@@ -217,6 +217,32 @@ class NodeAgentService:
         # Start new workloads from leases
         for lease in leases:
             existing = self.repository.get_runtime(lease.deployment_id)
+
+            # --- Pod-safe SUSPEND/RESUME (ORCH-H3) ---
+            # SAFETY (load-bearing): we only EVER suspend a runtime when the
+            # control-plane has EXPLICITLY marked this lease status='suspended'.
+            # Any other status, a missing/unknown status, or (handled in
+            # sync_leases) a control-plane that is unreachable => the lease does
+            # not reach this branch and the runtime KEEPS RUNNING by default.
+            # This is what guarantees the live tenant pods (lease.status='active')
+            # are never stopped by deploying this change.
+            lease_status = (getattr(lease, "status", None) or "").lower()
+            if lease_status == "suspended":
+                # Control-plane has explicitly suspended this lease. Stop the
+                # runtime in place (docker stop, NOT rm) and free its GPUs.
+                if existing is not None and existing.status in ("ready", "starting"):
+                    self._suspend_runtime(existing)
+                # If no live runtime exists (already suspended, or never started),
+                # there is nothing to do — never dispatch a fresh runtime for a
+                # suspended lease.
+                continue
+            if existing is not None and existing.status == "suspended":
+                # Lease is NOT suspended (handled above) but the local runtime is
+                # — the control-plane has resumed it (status back to active).
+                # Restart the SAME container and re-acquire its GPU allocation.
+                self._resume_runtime(existing)
+                continue
+
             if existing is not None:
                 # If the runtime was saved but never reached ready/failed, retry it
                 if existing.status in ("accepted", "starting"):
@@ -254,6 +280,15 @@ class NodeAgentService:
             if deployment_id in active_deployment_ids:
                 continue
             if runtime.status == "terminated":
+                continue
+            if runtime.status == "suspended":
+                # Pod-safe SUSPEND (ORCH-H3): a suspended runtime is an
+                # INTENTIONALLY stopped-but-preserved container. It must NEVER be
+                # treated as a fleet-wide orphan and destroyed — the control-plane
+                # keeps its lease visible (status='suspended') precisely so it is
+                # not orphan-reaped. Skip it: keep the container on disk so a
+                # later resume can `docker start` it. (Defense-in-depth even if a
+                # transient list_leases gap drops the suspended lease.)
                 continue
             if deployment_id in fleet_deployment_ids:
                 # Lease still exists, just pinned to ANOTHER node_id. This box
@@ -728,6 +763,151 @@ class NodeAgentService:
                 ))
             except ControlPlaneHTTPError:
                 logger.exception("failed to report termination for %s", runtime.deployment_id)
+
+    def _suspend_runtime(self, runtime: UnifiedRuntimeRecord) -> None:
+        """Pod-safe SUSPEND (ORCH-H3). Stop the runtime in place and free GPUs,
+        WITHOUT tearing it down. This is NOT a terminate:
+          - POD: `docker stop` the container (pause_pod) — filesystem, volumes,
+            SSH keys and port mappings are all preserved on disk so a later
+            resume can `docker start` the SAME container. We NEVER `docker rm -f`.
+          - INFERENCE: stop the (stateless, recreatable) serving container so the
+            GPUs free up; on resume it is re-dispatched fresh from the workload.
+          - VM: stop the VM; recreated on resume.
+        In every case we release the GPU allocation and report SUSPENDED back to
+        the control-plane. We do NOT report TERMINATED — the lease lives on.
+        Only ever called for a lease the control-plane has EXPLICITLY marked
+        status='suspended'."""
+        logger.info(
+            "suspending runtime %s (kind=%s) — docker stop / release GPUs, container preserved",
+            runtime.deployment_id, runtime.workload_kind,
+        )
+        # Release the GPU allocation so the freed cards become schedulable.
+        self.gpu_allocator.release(runtime.deployment_id)
+
+        kind = runtime.workload_kind
+        try:
+            if kind in (WorkloadKind.POD, "pod"):
+                # docker stop — preserves the container (NOT rm). pause_pod sets
+                # status='suspended' and KEEPS container_id for resume.
+                runtime = self.pod_backend.pause_pod(runtime)
+            elif kind in (WorkloadKind.INFERENCE, "inference"):
+                # Inference replicas are recreatable; stop_runtime tears the
+                # container down (rm) but that is safe — there is no tenant state
+                # to preserve. We then mark the record suspended so resume knows
+                # to re-dispatch it fresh.
+                if runtime.process_id or runtime.container_id:
+                    runtime = self.inference_backend.stop_runtime(runtime)
+                runtime = runtime.model_copy(update={
+                    "status": "suspended",
+                    "current_stage": "suspended",
+                    "metadata": {**runtime.metadata, "suspended_at": _utcnow().isoformat()},
+                    "updated_at": _utcnow(),
+                })
+            elif kind in (WorkloadKind.VM, "vm"):
+                if runtime.vm_id:
+                    self.vm_backend.stop_vm(runtime)
+                runtime = runtime.model_copy(update={
+                    "status": "suspended",
+                    "current_stage": "suspended",
+                    "metadata": {**runtime.metadata, "suspended_at": _utcnow().isoformat()},
+                    "updated_at": _utcnow(),
+                })
+            else:
+                runtime = runtime.model_copy(update={
+                    "status": "suspended",
+                    "current_stage": "suspended",
+                    "updated_at": _utcnow(),
+                })
+        except Exception:
+            logger.exception("backend suspend failed for %s — marking suspended anyway", runtime.deployment_id)
+            runtime = runtime.model_copy(update={
+                "status": "suspended",
+                "current_stage": "suspended",
+                "updated_at": _utcnow(),
+            })
+
+        self.repository.upsert_runtime(runtime)
+        try:
+            self.control_plane.update_deployment_status(DeploymentStatusUpdate(
+                deployment_id=runtime.deployment_id,
+                state=DeploymentState.SUSPENDED,
+            ))
+        except ControlPlaneHTTPError:
+            logger.exception("failed to report SUSPENDED for %s", runtime.deployment_id)
+
+    def _resume_runtime(self, runtime: UnifiedRuntimeRecord) -> None:
+        """Pod-safe RESUME (ORCH-H3). Bring a suspended runtime back online:
+          - re-acquire the GPU allocation (fails the resume if no capacity);
+          - POD: `docker start` the SAME container (resume_pod) — original data,
+            SSH keys and packages survive; report STARTING then READY;
+          - INFERENCE/VM: the container/VM was removed on suspend, so re-dispatch
+            it fresh from the workload spec.
+        Only ever called when a previously-suspended runtime's lease has returned
+        to a non-suspended (active) status."""
+        gpu_count = int(runtime.metadata.get("gpu_count", runtime.gpu_fraction or 1) or 1)
+        try:
+            gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count)
+        except GpuAllocationError as exc:
+            # No capacity to resume — leave it suspended; the control-plane will
+            # retry. Do NOT fail/terminate (that would destroy the preserved pod).
+            logger.warning(
+                "cannot resume %s — GPU re-allocation failed (%s); staying suspended",
+                runtime.deployment_id, exc,
+            )
+            return
+
+        kind = runtime.workload_kind
+        if kind in (WorkloadKind.POD, "pod"):
+            logger.info("resuming pod runtime %s — docker start (same container)", runtime.deployment_id)
+            runtime = runtime.model_copy(update={
+                "metadata": {**runtime.metadata, "gpu_devices": gpu_devices, "gpu_count": gpu_count},
+            })
+            try:
+                runtime = self.pod_backend.resume_pod(runtime)
+            except PodError as exc:
+                # docker start failed — release the just-acquired GPUs and leave
+                # the runtime suspended so a later reconcile retries. The
+                # container itself is untouched (still exists on disk).
+                logger.exception("pod resume failed for %s — staying suspended", runtime.deployment_id)
+                self.gpu_allocator.release(runtime.deployment_id)
+                runtime = runtime.model_copy(update={
+                    "status": "suspended",
+                    "current_stage": "suspended",
+                    "last_error": f"resume failed: {exc}",
+                    "updated_at": _utcnow(),
+                })
+                self.repository.upsert_runtime(runtime)
+                return
+            self.repository.upsert_runtime(runtime)
+            self._report_deployment_ready(runtime)
+            return
+
+        # INFERENCE / VM: recreate from the workload spec (container/VM was
+        # removed on suspend). Release the placeholder allocation we just took so
+        # the start handler can allocate cleanly, then re-dispatch.
+        self.gpu_allocator.release(runtime.deployment_id)
+        workload = None
+        try:
+            workload = self.control_plane.get_workload(runtime.workload_id)
+        except ControlPlaneHTTPError:
+            logger.exception("failed to fetch workload for resume of %s — staying suspended", runtime.deployment_id)
+        if workload is None:
+            logger.warning(
+                "workload %s not found for resume of %s — staying suspended",
+                runtime.workload_id, runtime.deployment_id,
+            )
+            return
+        # Reset to 'accepted' so the start handler treats it as a fresh dispatch.
+        runtime = runtime.model_copy(update={
+            "status": "accepted",
+            "current_stage": "accepted",
+            "updated_at": _utcnow(),
+        })
+        self.repository.upsert_runtime(runtime)
+        if kind in (WorkloadKind.INFERENCE, "inference"):
+            self._start_inference_runtime(runtime, workload)
+        elif kind in (WorkloadKind.VM, "vm"):
+            self._start_vm_runtime(runtime, workload)
 
     def terminate_deployment(self, deployment_id: str) -> dict[str, Any]:
         runtime = self.repository.get_runtime(deployment_id)
