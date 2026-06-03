@@ -283,12 +283,30 @@ class NodeAgentService:
                 continue
             if runtime.status == "suspended":
                 # Pod-safe SUSPEND (ORCH-H3): a suspended runtime is an
-                # INTENTIONALLY stopped-but-preserved container. It must NEVER be
-                # treated as a fleet-wide orphan and destroyed — the control-plane
-                # keeps its lease visible (status='suspended') precisely so it is
-                # not orphan-reaped. Skip it: keep the container on disk so a
-                # later resume can `docker start` it. (Defense-in-depth even if a
-                # transient list_leases gap drops the suspended lease.)
+                # INTENTIONALLY stopped-but-preserved container. Lease ABSENCE
+                # alone must NEVER destroy it — a transient list_leases gap would
+                # otherwise wipe preserved work. So before reaping, confirm with
+                # the control-plane: tear it down ONLY if the deployment is
+                # EXPLICITLY TERMINATED (the credit-exhaustion reaper deleting a
+                # saved/unsaved pod, or an operator cleanup). A still-SUSPENDED
+                # deployment — or an unreachable control-plane — keeps the
+                # container on disk for a later `docker start` resume.
+                terminated = False
+                try:
+                    dep = self.control_plane.get_deployment(deployment_id)
+                    terminated = dep is not None and dep.state == DeploymentState.TERMINATED
+                except Exception:
+                    logger.warning(
+                        "could not confirm deployment state for suspended runtime %s — keeping it",
+                        deployment_id,
+                    )
+                if terminated:
+                    logger.info(
+                        "reaping suspended runtime %s — control-plane terminated the deployment",
+                        deployment_id,
+                    )
+                    self._terminate_runtime(runtime, reason="lease_terminated")
+                    self.repository.remove_runtime(deployment_id)
                 continue
             if deployment_id in fleet_deployment_ids:
                 # Lease still exists, just pinned to ANOTHER node_id. This box
