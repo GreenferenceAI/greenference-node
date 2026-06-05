@@ -549,7 +549,15 @@ class DockerInferenceBackend(InferenceBackend):
         self,
         *,
         backend_name: str = "docker-vllm-backend",
-        health_timeout_seconds: float = 600.0,
+        # Multimodal/vision models (e.g. Qwen2-VL) cold-start much slower than
+        # text-only ones — image pull + weight download + a longer torch.compile
+        # and a multi-modal warmup pass routinely pushed total startup just past
+        # the old 600s ceiling, so every vision placement timed out in
+        # _wait_for_health (531 health_check_failures observed, 0 ready replicas).
+        # Default to 1200s and allow per-box override for very cold caches.
+        health_timeout_seconds: float = float(
+            os.getenv("GREENCOMPUTE_VLLM_HEALTH_TIMEOUT_SECONDS", "1200.0")
+        ),
         default_image: str | None = None,
         gpu_memory_utilization: float = 0.90,
     ) -> None:
