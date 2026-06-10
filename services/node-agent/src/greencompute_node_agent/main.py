@@ -20,6 +20,27 @@ logger = logging.getLogger(__name__)
 settings = load_settings()
 service = NodeAgentService(settings)
 
+
+def _warn_unreachable_ssh_host() -> None:
+    """A pod's SSH endpoint is built as ssh://root@{ssh_host}:{port}. If ssh_host
+    is a loopback/bind-all/empty address, pods come up `ready` but hand the user
+    an UNREACHABLE endpoint (and /ssh returns a key that can never connect).
+    Warn loudly at startup so a misconfigured box is caught before it serves pods."""
+    if "pod" not in [k.strip().lower() for k in settings.supported_workload_kinds]:
+        return
+    host = (settings.ssh_host or "").strip()
+    if host in ("", "127.0.0.1", "0.0.0.0", "localhost", "::1"):
+        logger.warning(
+            "GREENCOMPUTE_SSH_HOST=%r is not a routable address — pod SSH endpoints "
+            "(ssh://root@%s:PORT) will be UNREACHABLE to clients. Set it to this "
+            "node's public IP/hostname.",
+            host or "<unset>",
+            host or "<unset>",
+        )
+
+
+_warn_unreachable_ssh_host()
+
 _worker_state: dict[str, object | None] = {
     "running": False,
     "last_iteration": None,
