@@ -30,6 +30,11 @@ services:
       GREENCOMPUTE_MINER_HOTKEY: "${GREENCOMPUTE_MINER_HOTKEY}"
       GREENCOMPUTE_MINER_PAYOUT_ADDRESS: "${GREENCOMPUTE_MINER_PAYOUT_ADDRESS:-}"
       GREENCOMPUTE_MINER_AUTH_SECRET: "${GREENCOMPUTE_MINER_AUTH_SECRET:-greencompute-node-local-secret}"
+      # Gateway↔node-agent :8007 auth (X-Agent-Auth). Must match the gateway's
+      # GREENCOMPUTE_INFERENCE_AUTH_SECRET. When set, the node enforces it on the
+      # inference/stats routes; the /agent/v1/* control routes fail closed when it
+      # (and AGENT/COMPUTE) is unset.
+      GREENCOMPUTE_INFERENCE_AUTH_SECRET: "${GREENCOMPUTE_INFERENCE_AUTH_SECRET:-}"
       GREENCOMPUTE_MINER_API_BASE_URL: "${GREENCOMPUTE_MINER_API_BASE_URL:-http://127.0.0.1:8007}"
       GREENCOMPUTE_MINER_VALIDATOR_URL: "${GREENCOMPUTE_MINER_VALIDATOR_URL}"
       GREENCOMPUTE_MINER_NODE_ID: "${GREENCOMPUTE_MINER_NODE_ID:-node-01}"
