@@ -15,7 +15,7 @@ from greencompute_protocol import (
     MinerRegistration,
 )
 
-from greencompute_node_agent.transport.security import validate_auth, validate_optional_auth
+from greencompute_node_agent.transport.security import validate_auth
 
 router = APIRouter()
 
@@ -141,7 +141,9 @@ async def chat_completions(
     payload: dict,
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> dict:
-    validate_auth(x_agent_auth, _cfg(), sensitive=False)
+    # Fail-closed: the gateway reaches inference via /inference/{id}/v1/chat/completions,
+    # not this /agent/v1 alias, so closing it removes a second unauthenticated entrypoint.
+    validate_auth(x_agent_auth, _cfg(), sensitive=True)
     result = _svc().invoke_inference(deployment_id, payload)
     if result is None:
         raise HTTPException(status_code=404, detail="inference deployment not found or not ready")
