@@ -15,7 +15,7 @@ from greencompute_protocol import (
     MinerRegistration,
 )
 
-from greencompute_node_agent.transport.security import validate_optional_auth
+from greencompute_node_agent.transport.security import validate_auth, validate_optional_auth
 
 router = APIRouter()
 
@@ -50,7 +50,7 @@ def register(
     payload: MinerRegistration,
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> dict:
-    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
+    validate_auth(x_agent_auth, _cfg(), sensitive=True)
     result = _svc().onboard(payload)
     return result.model_dump(mode="json")
 
@@ -60,7 +60,7 @@ def publish_capacity(
     payload: CapacityUpdate,
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> dict:
-    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
+    validate_auth(x_agent_auth, _cfg(), sensitive=True)
     result = _svc().publish_capacity(payload)
     return result.model_dump(mode="json")
 
@@ -70,7 +70,7 @@ def publish_heartbeat(
     payload: Heartbeat,
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> dict:
-    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
+    validate_auth(x_agent_auth, _cfg(), sensitive=True)
     result = _svc().publish_heartbeat(payload)
     return result.model_dump(mode="json")
 
@@ -80,7 +80,7 @@ def list_leases(
     hotkey: str,
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> list[dict]:
-    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
+    validate_auth(x_agent_auth, _cfg(), sensitive=True)
     leases = _svc().sync_leases(hotkey)
     return [lease.model_dump(mode="json") for lease in leases]
 
@@ -90,7 +90,7 @@ def reconcile(
     hotkey: str,
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> dict:
-    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
+    validate_auth(x_agent_auth, _cfg(), sensitive=True)
     _svc().reconcile_once(hotkey)
     return {"status": "ok"}
 
@@ -100,7 +100,7 @@ def recovery(
     hotkey: str,
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> dict:
-    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
+    validate_auth(x_agent_auth, _cfg(), sensitive=True)
     return _svc().recover_runtime_state(hotkey)
 
 
@@ -111,7 +111,7 @@ def recovery(
 def list_runtimes(
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> list[dict]:
-    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
+    validate_auth(x_agent_auth, _cfg(), sensitive=True)
     return [rt.model_dump(mode="json") for rt in _svc().repository.runtimes.values()]
 
 
@@ -119,7 +119,7 @@ def list_runtimes(
 def runtime_summary(
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> dict:
-    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
+    validate_auth(x_agent_auth, _cfg(), sensitive=True)
     return _svc().runtime_summary()
 
 
@@ -128,7 +128,7 @@ def get_runtime(
     deployment_id: str,
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> dict:
-    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
+    validate_auth(x_agent_auth, _cfg(), sensitive=True)
     runtime = _svc().repository.get_runtime(deployment_id)
     if runtime is None:
         raise HTTPException(status_code=404, detail="runtime not found")
@@ -141,7 +141,7 @@ async def chat_completions(
     payload: dict,
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> dict:
-    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
+    validate_auth(x_agent_auth, _cfg(), sensitive=False)
     result = _svc().invoke_inference(deployment_id, payload)
     if result is None:
         raise HTTPException(status_code=404, detail="inference deployment not found or not ready")
@@ -149,8 +149,12 @@ async def chat_completions(
 
 
 @router.get("/inference/{deployment_id}/healthz")
-def inference_healthz(deployment_id: str) -> dict:
+def inference_healthz(
+    deployment_id: str,
+    x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
+) -> dict:
     """Health check for a specific inference runtime."""
+    validate_auth(x_agent_auth, _cfg(), sensitive=False)
     runtime = _svc().repository.get_runtime(deployment_id)
     if runtime is None or runtime.status != "ready" or not runtime.runtime_url:
         raise HTTPException(status_code=503, detail="not ready")
@@ -158,12 +162,16 @@ def inference_healthz(deployment_id: str) -> dict:
 
 
 @router.get("/pods/{deployment_id}/stats")
-def pod_stats(deployment_id: str) -> dict:
+def pod_stats(
+    deployment_id: str,
+    x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
+) -> dict:
     """Live resource stats for a running pod/inference runtime.
 
     Best-effort — any probe that fails is omitted from the response so the UI
     can show partial data. Returns at most a few dozen bytes of JSON.
     """
+    validate_auth(x_agent_auth, _cfg(), sensitive=False)
     runtime = _svc().repository.get_runtime(deployment_id)
     if runtime is None or not runtime.container_id:
         raise HTTPException(status_code=404, detail="runtime not found")
@@ -197,7 +205,7 @@ async def inference_proxy(
     over a public IP) could bypass the gateway's balance / rate-limit
     enforcement and invoke models directly via the deployment_id.
     """
-    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
+    validate_auth(x_agent_auth, _cfg(), sensitive=False)
     runtime = _svc().repository.get_runtime(deployment_id)
     if runtime is None or runtime.status != "ready" or not runtime.runtime_url:
         raise HTTPException(status_code=404, detail="inference runtime not found or not ready")
@@ -230,7 +238,7 @@ def get_ssh_access(
     include_private_key: bool = False,
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> dict:
-    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
+    validate_auth(x_agent_auth, _cfg(), sensitive=True)
     access = _svc().get_ssh_access(deployment_id, include_private_key=include_private_key)
     if access is None:
         raise HTTPException(status_code=404, detail="SSH access not available for this deployment")
@@ -242,7 +250,7 @@ def terminate_deployment(
     deployment_id: str,
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> dict:
-    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
+    validate_auth(x_agent_auth, _cfg(), sensitive=True)
     return _svc().terminate_deployment(deployment_id)
 
 
@@ -250,7 +258,7 @@ def terminate_deployment(
 def gpu_status(
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> dict:
-    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
+    validate_auth(x_agent_auth, _cfg(), sensitive=True)
     return _svc().gpu_allocator.status()
 
 
@@ -258,5 +266,5 @@ def gpu_status(
 def fleet_status(
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> dict:
-    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
+    validate_auth(x_agent_auth, _cfg(), sensitive=True)
     return _svc().fleet_status()
