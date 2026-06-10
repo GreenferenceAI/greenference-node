@@ -37,16 +37,32 @@ configure_ssh() {
     # Generate host keys if missing
     ssh-keygen -A 2>/dev/null || true
 
-    # Configure sshd: root login, key auth only, port 22
+    # Configure sshd: root login, KEY-ONLY auth (no passwords), port 22.
+    # Password auth is disabled on purpose: no root password is ever set, so it
+    # could never succeed anyway, and leaving it on turns a failed key auth into
+    # a misleading password PROMPT instead of a clear "Permission denied
+    # (publickey)" — which sends users debugging the wrong thing.
     local cfg=/etc/ssh/sshd_config
     if [ -f "$cfg" ]; then
         sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' "$cfg"
         sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$cfg"
-        sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$cfg"
+        sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$cfg"
         sed -i 's/^#\?Port .*/Port 22/' "$cfg"
         # Ensure these are set even if not present
         grep -q "^PermitRootLogin" "$cfg" || echo "PermitRootLogin yes" >> "$cfg"
         grep -q "^PubkeyAuthentication" "$cfg" || echo "PubkeyAuthentication yes" >> "$cfg"
+        grep -q "^PasswordAuthentication" "$cfg" || echo "PasswordAuthentication no" >> "$cfg"
+    fi
+    # Many base images (Ubuntu/Debian) Include /etc/ssh/sshd_config.d/*.conf
+    # FIRST, so a shipped drop-in (e.g. 50-cloud-init.conf: "PasswordAuthentication
+    # yes") would override the main config above. A 00- drop-in sorts first and
+    # wins, so key-only auth holds regardless of the user's chosen image.
+    if [ -d /etc/ssh/sshd_config.d ]; then
+        cat > /etc/ssh/sshd_config.d/00-greencompute.conf <<'EOF'
+PermitRootLogin yes
+PubkeyAuthentication yes
+PasswordAuthentication no
+EOF
     fi
 }
 
