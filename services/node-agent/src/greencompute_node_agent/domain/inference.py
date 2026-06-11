@@ -468,15 +468,26 @@ _VLLM_CU12_IMAGE = "vllm/vllm-openai:v0.8.5"
 
 
 def _auto_select_vllm_image() -> str:
-    """Pick a vLLM image based on this host's NVIDIA driver + GPU arch.
+    """Pick a vLLM image based on this host's GPU arch + NVIDIA driver.
 
-    Logic:
-      - sm_120 (RTX 5090 / Blackwell) → cu130 image (mandatory; older vLLM
-        doesn't have Blackwell kernels). Driver MUST be >= 580.
-      - sm_89 (RTX 4090 / Ada) or older → driver-aware:
-          driver >= 580 → cu130 image (newer is fine)
-          driver  < 580 → cu12 image (older vLLM, avoids the
-            'forward compatibility on non supported HW' error 804)
+    Compute capability decides FIRST — the cu130 image simply doesn't ship
+    kernels for every arch — then the driver breaks the tie where both
+    images have kernels:
+      - sm_120 (RTX 5090 / Blackwell) → cu130 image (mandatory; the cu12
+        image has no Blackwell kernels). Driver MUST be >= 580.
+      - pre-Ada, sm < 8.9 (Ampere A4000/A100, Turing, …) → cu12 image
+        REGARDLESS of driver: the cu130 image has no sm_8x kernels →
+        cudaErrorNoKernelImageForDevice at startup (proven on the A4000 box,
+        sm_86 + driver 580; v0.8.5 is its verified-working image). A new
+        driver runs an old CUDA image fine — error 804 is only the
+        old-driver/new-CUDA direction.
+      - sm_89 (RTX 4090 / Ada) → driver-aware:
+          driver >= 580 → cu130 image (has sm_89 kernels; proven on .12)
+          driver  < 580 → cu12 image (avoids the 'forward compatibility on
+            non supported HW' error 804)
+
+    Mixed pre-Ada + Blackwell hosts are unsupported (no single image covers
+    both); Blackwell wins since cu12 cannot run there at all.
 
     Falls back to cu130 if nvidia-smi isn't available — gives a clear
     signal at container start instead of silently picking wrong.
@@ -499,9 +510,16 @@ def _auto_select_vllm_image() -> str:
     except (subprocess.SubprocessError, OSError):
         return _VLLM_CU130_IMAGE
 
+    return _pick_vllm_image(out)
+
+
+def _pick_vllm_image(nvidia_smi_csv: str) -> str:
+    """Pure decision core of _auto_select_vllm_image — split out so the
+    arch/driver matrix is unit-testable without nvidia-smi."""
     max_compute = 0.0
+    min_compute = 999.0
     min_driver_major = 9999
-    for line in out.splitlines():
+    for line in nvidia_smi_csv.splitlines():
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 2:
             continue
@@ -511,12 +529,18 @@ def _auto_select_vllm_image() -> str:
         except (ValueError, IndexError):
             continue
         max_compute = max(max_compute, cc)
+        min_compute = min(min_compute, cc)
         min_driver_major = min(min_driver_major, drv_major)
 
     # sm_120+ (Blackwell, e.g. RTX 5090) → must use cu130
     if max_compute >= 12.0:
         return _VLLM_CU130_IMAGE
-    # Pre-Blackwell + older driver → fall back to cu12 to avoid error 804
+    # Any pre-Ada GPU present (sm < 8.9): cu130 has no kernels for it, so
+    # the runtime could land on a GPU it cannot execute on. cu12 covers the
+    # whole host. min_compute==999.0 means we parsed nothing → fall through.
+    if min_compute < 8.9:
+        return _VLLM_CU12_IMAGE
+    # Ada + older driver → cu12 to avoid error 804
     if min_driver_major < 580 and min_driver_major != 9999:
         return _VLLM_CU12_IMAGE
     return _VLLM_CU130_IMAGE
