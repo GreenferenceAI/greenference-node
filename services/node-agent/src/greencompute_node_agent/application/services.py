@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import UTC, datetime
 from typing import Any
 
@@ -99,6 +100,15 @@ class NodeAgentService:
         # GPU device allocator
         self.gpu_allocator = GpuAllocator(settings.gpu_count)
 
+        # Serializes the compound reconcile/recover flow. The per-operation
+        # locks on GpuAllocator/NodeAgentRepository only guard single calls;
+        # the snapshot→allocate→docker-run→upsert sequence must be atomic as a
+        # whole, or the worker loop and the manual /reconcile + /recovery routes
+        # (all run in the threadpool) can both observe a lease as unstarted and
+        # each allocate GPUs for it — leaking allocations and orphaning a
+        # container on the docker-name collision.
+        self._reconcile_lock = threading.Lock()
+
         # Rebuild allocator state from persisted runtimes — prevents double-
         # allocation across node-agent restarts. Running containers from
         # before the restart still hold their GPUs via --gpus; the allocator
@@ -191,6 +201,19 @@ class NodeAgentService:
             return []
 
     def reconcile_once(self, hotkey: str) -> None:
+        """Serialize the reconcile flow against the worker loop and the manual
+        /reconcile + /recovery routes. If a pass is already running we skip
+        rather than race into a double GPU allocation; the next tick (or a
+        retry of the manual trigger) picks it up."""
+        if not self._reconcile_lock.acquire(blocking=False):
+            logger.info("reconcile already in progress — skipping this trigger")
+            return
+        try:
+            self._reconcile_once_locked(hotkey)
+        finally:
+            self._reconcile_lock.release()
+
+    def _reconcile_once_locked(self, hotkey: str) -> None:
         """Main reconciliation loop: sync leases, dispatch workloads, cleanup orphans."""
         all_leases = self.sync_leases(hotkey)
         # Multi-box-per-hotkey: the control-plane returns EVERY lease for the
@@ -555,8 +578,21 @@ class NodeAgentService:
             port_allocations[container_port] = host_port
             used_host_ports.add(host_port)
 
-        # Allocate specific GPU devices
+        # Allocate specific GPU devices. Honor no-GPU templates (e.g.
+        # ubuntu-ssh, gpu_fraction=0.0): a CPU-only pod must NOT reserve a whole
+        # physical GPU. WorkloadRequirements.gpu_count is floored at 1 by the
+        # protocol, so the template's gpu_fraction is the only signal that the
+        # tenant asked for a CPU pod.
         gpu_count = workload.requirements.gpu_count if workload.requirements else 1
+        if template_name:
+            from greencompute_node_agent.domain.templates import get_template
+            tpl = get_template(template_name)
+            if tpl is not None and tpl.gpu_fraction == 0.0:
+                gpu_count = 0
+                logger.info(
+                    "pod %s uses no-GPU template %r — skipping GPU allocation",
+                    runtime.deployment_id, template_name,
+                )
         try:
             gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count)
         except GpuAllocationError as exc:
@@ -593,7 +629,10 @@ class NodeAgentService:
         # workload explicitly requests a smaller slice, honor that; otherwise
         # cap at the fair share.
         host_gpus = max(s.gpu_count, 1)
-        gpu_fraction_of_host = gpu_count / host_gpus
+        # CPU-only pods (gpu_count==0) still get one GPU-slot's worth of CPU/RAM
+        # rather than the degenerate 1-core/1GB floor a 0 numerator would yield.
+        sizing_gpu_units = gpu_count if gpu_count > 0 else 1
+        gpu_fraction_of_host = sizing_gpu_units / host_gpus
         max_cpu = max(1.0, round(s.cpu_cores * gpu_fraction_of_host, 2))
         max_mem_gb = max(1, int(s.memory_gb * gpu_fraction_of_host))
         req_cpu = float(getattr(workload.requirements, "cpu_cores", 0) or 0) if workload.requirements else 0.0
@@ -969,6 +1008,18 @@ class NodeAgentService:
     })
 
     def recover_runtime_state(self, hotkey: str) -> dict[str, Any]:
+        """Recover persisted runtimes under the reconcile lock so it can't race
+        a concurrent reconcile pass into double GPU allocation. Skips (returns
+        busy) rather than blocking if a pass is already running."""
+        if not self._reconcile_lock.acquire(blocking=False):
+            logger.info("reconcile in progress — deferring recovery")
+            return {"status": "busy", "resumed": 0, "terminated": 0}
+        try:
+            return self._recover_runtime_state_locked(hotkey)
+        finally:
+            self._reconcile_lock.release()
+
+    def _recover_runtime_state_locked(self, hotkey: str) -> dict[str, Any]:
         """On startup, check persisted runtimes and tear down only the ones the
         control-plane confirms are gone/dead. Keep-by-default so a node-agent
         restart never kills in-flight or running pods; a control-plane blip is

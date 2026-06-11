@@ -42,6 +42,38 @@ def _cfg():
     return _settings
 
 
+# Metadata keys carrying secrets that must never leave the box via the
+# observability routes. The dedicated /ssh endpoint is the only path allowed to
+# emit the SSH private key (and only when include_private_key=True).
+_REDACT_PLACEHOLDER = "***redacted***"
+
+
+def _is_secret_key(key: str) -> bool:
+    k = key.lower()
+    # NB: keep ssh_public_keys / ssh_fingerprint visible — only private material.
+    return (
+        "private_key" in k
+        or "secret" in k
+        or "password" in k
+        or "hf_token" in k
+        or k == "token"
+        or k.endswith("_token")
+    )
+
+
+def _redact(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: (_REDACT_PLACEHOLDER if _is_secret_key(k) else _redact(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+    return value
+
+
+def _runtime_public_dump(runtime: Any) -> dict:
+    """Serialize a runtime record with secret metadata fields redacted."""
+    return _redact(runtime.model_dump(mode="json"))
+
+
 # --- Agent lifecycle endpoints ---
 
 
@@ -112,7 +144,7 @@ def list_runtimes(
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> list[dict]:
     validate_auth(x_agent_auth, _cfg(), sensitive=True)
-    return [rt.model_dump(mode="json") for rt in _svc().repository.snapshot_runtimes()]
+    return [_runtime_public_dump(rt) for rt in _svc().repository.snapshot_runtimes()]
 
 
 @router.get("/agent/v1/runtimes/summary")
@@ -132,7 +164,7 @@ def get_runtime(
     runtime = _svc().repository.get_runtime(deployment_id)
     if runtime is None:
         raise HTTPException(status_code=404, detail="runtime not found")
-    return runtime.model_dump(mode="json")
+    return _runtime_public_dump(runtime)
 
 
 @router.post("/agent/v1/deployments/{deployment_id}/chat/completions")
