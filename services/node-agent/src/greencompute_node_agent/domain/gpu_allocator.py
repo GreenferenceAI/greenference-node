@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 
 from greencompute_node_agent.domain.gpu_docker import gpu_docker_flags
@@ -26,13 +27,19 @@ class GpuAllocator:
         self.device_ids = set(range(total_gpus))
         # deployment_id → set of allocated device IDs
         self._allocations: dict[str, set[int]] = {}
+        # Allocations are read/mutated from the heartbeat loop, the worker
+        # loop, and FastAPI sync routes — each on its own thread. RLock
+        # because allocate/release log via used_count, which re-enters
+        # free_devices.
+        self._lock = threading.RLock()
 
     @property
     def free_devices(self) -> set[int]:
-        used = set()
-        for devices in self._allocations.values():
-            used |= devices
-        return self.device_ids - used
+        with self._lock:
+            used = set()
+            for devices in self._allocations.values():
+                used |= devices
+            return self.device_ids - used
 
     @property
     def free_count(self) -> int:
@@ -53,19 +60,22 @@ class GpuAllocator:
             raise GpuAllocationError(
                 f"requested {gpu_count} GPUs but node only has {self.total_gpus}"
             )
-        free = sorted(self.free_devices)
-        if len(free) < gpu_count:
-            raise GpuAllocationError(
-                f"requested {gpu_count} GPUs but only {len(free)} free "
-                f"(total={self.total_gpus}, used by {len(self._allocations)} workloads)"
+        # check-free + claim must be one atomic step or two threads can
+        # both see the same free devices and double-allocate them.
+        with self._lock:
+            free = sorted(self.free_devices)
+            if len(free) < gpu_count:
+                raise GpuAllocationError(
+                    f"requested {gpu_count} GPUs but only {len(free)} free "
+                    f"(total={self.total_gpus}, used by {len(self._allocations)} workloads)"
+                )
+            allocated = free[:gpu_count]
+            self._allocations[deployment_id] = set(allocated)
+            logger.info(
+                "allocated GPUs %s to %s (%d/%d now used)",
+                allocated, deployment_id, self.used_count, self.total_gpus,
             )
-        allocated = free[:gpu_count]
-        self._allocations[deployment_id] = set(allocated)
-        logger.info(
-            "allocated GPUs %s to %s (%d/%d now used)",
-            allocated, deployment_id, self.used_count, self.total_gpus,
-        )
-        return allocated
+            return allocated
 
     def allocate_specific(self, deployment_id: str, devices: list[int]) -> list[int]:
         """Reserve EXACTLY these device indices for a deployment.
@@ -79,44 +89,68 @@ class GpuAllocator:
         want = {int(d) for d in devices}
         if not want:
             return []
-        available = self.free_devices | self._allocations.get(deployment_id, set())
-        if not want.issubset(available):
-            taken = sorted(want - available)
-            raise GpuAllocationError(
-                f"cannot reserve devices {sorted(want)} for {deployment_id}: "
-                f"{taken} already in use by another workload"
+        with self._lock:
+            available = self.free_devices | self._allocations.get(deployment_id, set())
+            if not want.issubset(available):
+                taken = sorted(want - available)
+                raise GpuAllocationError(
+                    f"cannot reserve devices {sorted(want)} for {deployment_id}: "
+                    f"{taken} already in use by another workload"
+                )
+            self._allocations[deployment_id] = want
+            logger.info(
+                "reserved specific GPUs %s for %s (%d/%d now used)",
+                sorted(want), deployment_id, self.used_count, self.total_gpus,
             )
-        self._allocations[deployment_id] = want
-        logger.info(
-            "reserved specific GPUs %s for %s (%d/%d now used)",
-            sorted(want), deployment_id, self.used_count, self.total_gpus,
-        )
-        return sorted(want)
+            return sorted(want)
 
     def release(self, deployment_id: str) -> list[int]:
         """Release GPUs for a deployment. Returns the freed device IDs."""
-        devices = self._allocations.pop(deployment_id, set())
-        if devices:
-            logger.info(
-                "released GPUs %s from %s (%d/%d now used)",
-                sorted(devices), deployment_id, self.used_count, self.total_gpus,
-            )
-        return sorted(devices)
+        with self._lock:
+            devices = self._allocations.pop(deployment_id, set())
+            if devices:
+                logger.info(
+                    "released GPUs %s from %s (%d/%d now used)",
+                    sorted(devices), deployment_id, self.used_count, self.total_gpus,
+                )
+            return sorted(devices)
 
     def get_allocation(self, deployment_id: str) -> list[int]:
         """Get device IDs allocated to a deployment."""
-        return sorted(self._allocations.get(deployment_id, set()))
+        with self._lock:
+            return sorted(self._allocations.get(deployment_id, set()))
+
+    def rehydrate(self, deployment_id: str, devices: set[int]) -> None:
+        """Record a persisted allocation at startup recovery. Unlike
+        allocate_specific this never raises on overlap — the container is
+        already running on those devices, so recording the conflict (and
+        shrinking free_devices conservatively) beats refusing and letting
+        the scheduler hand the same card out again — but it warns loudly."""
+        want = {int(d) for d in devices}
+        with self._lock:
+            overlap = {
+                dep: sorted(want & alloc)
+                for dep, alloc in self._allocations.items()
+                if dep != deployment_id and want & alloc
+            }
+            if overlap:
+                logger.warning(
+                    "rehydrated allocation for %s overlaps existing allocations: %s",
+                    deployment_id, overlap,
+                )
+            self._allocations[deployment_id] = want
 
     def status(self) -> dict[str, Any]:
-        return {
-            "total_gpus": self.total_gpus,
-            "free_gpus": self.free_count,
-            "used_gpus": self.used_count,
-            "allocations": {
-                dep_id: sorted(devices)
-                for dep_id, devices in self._allocations.items()
-            },
-        }
+        with self._lock:
+            return {
+                "total_gpus": self.total_gpus,
+                "free_gpus": self.free_count,
+                "used_gpus": self.used_count,
+                "allocations": {
+                    dep_id: sorted(devices)
+                    for dep_id, devices in self._allocations.items()
+                },
+            }
 
     def docker_gpu_flag(self, deployment_id: str) -> list[str]:
         """Return Docker flags for GPU passthrough (auto-detected method)."""

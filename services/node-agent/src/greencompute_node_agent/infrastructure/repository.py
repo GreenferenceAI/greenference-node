@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from typing import Any
 
 from greencompute_protocol import (
@@ -24,6 +25,11 @@ class NodeAgentRepository:
         self.placements: dict[str, ComputePlacementRecord] = {}
         self.volumes: dict[str, VolumeRecord] = {}
         self.collateral: dict[str, CollateralRecord] = {}
+        # Mutated from the worker loop (reconcile/terminate), read from the
+        # heartbeat loop (capacity) and FastAPI sync routes — all separate
+        # threads. The lock also serializes save(), whose dict comprehension
+        # would otherwise see "dictionary changed size during iteration".
+        self._lock = threading.RLock()
         self._load()
 
     def _load(self) -> None:
@@ -45,34 +51,48 @@ class NodeAgentRepository:
             logger.exception("failed to load state from %s", self.state_path)
 
     def save(self) -> None:
-        data: dict[str, Any] = {
-            "runtimes": {k: v.model_dump(mode="json") for k, v in self.runtimes.items()},
-            "placements": {k: v.model_dump(mode="json") for k, v in self.placements.items()},
-            "volumes": {k: v.model_dump(mode="json") for k, v in self.volumes.items()},
-            "collateral": {k: v.model_dump(mode="json") for k, v in self.collateral.items()},
-        }
-        tmp = self.state_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, self.state_path)
+        with self._lock:
+            data: dict[str, Any] = {
+                "runtimes": {k: v.model_dump(mode="json") for k, v in self.runtimes.items()},
+                "placements": {k: v.model_dump(mode="json") for k, v in self.placements.items()},
+                "volumes": {k: v.model_dump(mode="json") for k, v in self.volumes.items()},
+                "collateral": {k: v.model_dump(mode="json") for k, v in self.collateral.items()},
+            }
+            tmp = self.state_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.state_path)
 
     def upsert_runtime(self, runtime: UnifiedRuntimeRecord) -> UnifiedRuntimeRecord:
-        self.runtimes[runtime.deployment_id] = runtime
-        self.save()
-        return runtime
+        with self._lock:
+            self.runtimes[runtime.deployment_id] = runtime
+            self.save()
+            return runtime
 
     def get_runtime(self, deployment_id: str) -> UnifiedRuntimeRecord | None:
-        return self.runtimes.get(deployment_id)
+        with self._lock:
+            return self.runtimes.get(deployment_id)
 
     def remove_runtime(self, deployment_id: str) -> None:
-        self.runtimes.pop(deployment_id, None)
-        self.save()
+        with self._lock:
+            self.runtimes.pop(deployment_id, None)
+            self.save()
+
+    def snapshot_runtimes(self) -> list[UnifiedRuntimeRecord]:
+        """Point-in-time copy for iteration outside the lock — use this
+        instead of iterating .runtimes.values() from another thread."""
+        with self._lock:
+            return list(self.runtimes.values())
+
+    def snapshot_runtime_items(self) -> list[tuple[str, UnifiedRuntimeRecord]]:
+        with self._lock:
+            return list(self.runtimes.items())
 
     def runtime_summary(self) -> dict[str, Any]:
         by_status: dict[str, int] = {}
         by_kind: dict[str, int] = {}
         failed = 0
-        for rt in self.runtimes.values():
+        for rt in self.snapshot_runtimes():
             by_status[rt.status] = by_status.get(rt.status, 0) + 1
             by_kind[rt.workload_kind] = by_kind.get(rt.workload_kind, 0) + 1
             if rt.status == "failed":
