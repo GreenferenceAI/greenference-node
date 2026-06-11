@@ -160,6 +160,12 @@ class NodeAgentService:
                 reserved_gpus += len(devices) or int(rt.metadata.get("gpu_count", 1) or 1)
         available_gpus = max(0, s.gpu_count - reserved_gpus)
 
+        # The scheduler's workload_kinds filter reads this label (exact
+        # comma-separated tokens; absent = node accepts everything). Without
+        # it a pod/vm rental could be placed on an inference-only node.
+        kinds = ",".join(
+            k.strip().lower() for k in s.supported_workload_kinds if k.strip()
+        )
         node = NodeCapability(
             hotkey=s.miner_hotkey,
             node_id=s.node_id,
@@ -171,6 +177,7 @@ class NodeAgentService:
             memory_gb=s.memory_gb,
             performance_score=s.performance_score,
             security_tier=s.security_tier,
+            labels={"workload_kinds": kinds} if kinds else {},
         )
         return CapacityUpdate(hotkey=s.miner_hotkey, nodes=[node])
 

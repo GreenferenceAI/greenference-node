@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 
 from fastapi import FastAPI, HTTPException, status
 
-from greencompute_protocol import Heartbeat, MinerRegistration
+from greencompute_protocol import Heartbeat, MinerRegistration, WorkloadKind
 
 from greencompute_node_agent.application.services import NodeAgentService
 from greencompute_node_agent.config import load_settings
@@ -51,13 +51,33 @@ _worker_state: dict[str, object | None] = {
 }
 
 
+def _supported_kinds() -> list[WorkloadKind]:
+    """Settings kinds → WorkloadKind list, dropping (and logging) unknown
+    tokens instead of failing registration over an env typo. Empty result
+    falls back to the protocol default rather than registering with []."""
+    kinds: list[WorkloadKind] = []
+    for raw in settings.supported_workload_kinds:
+        token = raw.strip().lower()
+        if not token:
+            continue
+        try:
+            kinds.append(WorkloadKind(token))
+        except ValueError:
+            logger.warning("ignoring unknown workload kind %r in GREENCOMPUTE_SUPPORTED_WORKLOAD_KINDS", raw)
+    return kinds or [WorkloadKind.INFERENCE]
+
+
 def _bootstrap() -> None:
+    # supported_workload_kinds was previously never sent, so every miner row
+    # held the protocol default ["inference"] regardless of what the box
+    # actually serves — keep the persisted record truthful.
     registration = MinerRegistration(
         hotkey=settings.miner_hotkey,
         payout_address=settings.miner_payout_address,
         auth_secret=settings.miner_auth_secret,
         api_base_url=settings.miner_api_base_url,
         validator_url=settings.miner_validator_url,
+        supported_workload_kinds=_supported_kinds(),
     )
     service.onboard(registration)
     service.publish_heartbeat(Heartbeat(hotkey=settings.miner_hotkey, healthy=True))
