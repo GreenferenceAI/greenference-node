@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from greencompute_node_agent.transport.routes import _is_secret_key, _redact
+from greencompute_node_agent.transport.redaction import is_secret_key as _is_secret_key
+from greencompute_node_agent.transport.redaction import redact as _redact
 
 
 def test_secret_key_classification():
