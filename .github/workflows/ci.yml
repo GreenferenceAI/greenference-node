@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # tests/conftest.py expects the protocol repo as a SIBLING directory
+      # (../greencompute/protocol/src), so check both repos out side by side.
+      - uses: actions/checkout@v4
+        with:
+          path: greencompute-node
+
+      - uses: actions/checkout@v4
+        with:
+          repository: greencompute110/greencompute
+          path: greencompute
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      # Hard gate on the errors that are always bugs (syntax errors,
+      # undefined names); the full ruleset has no clean baseline yet.
+      - name: Lint (critical)
+        working-directory: greencompute-node
+        run: uvx ruff check --select E9,F63,F7,F82 .
+
+      - name: Unit tests
+        working-directory: greencompute-node
+        run: uv run --no-project --python 3.12 --with pytest --with pydantic pytest tests -q
