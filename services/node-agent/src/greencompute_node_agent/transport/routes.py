@@ -112,7 +112,7 @@ def list_runtimes(
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> list[dict]:
     validate_auth(x_agent_auth, _cfg(), sensitive=True)
-    return [rt.model_dump(mode="json") for rt in _svc().repository.runtimes.values()]
+    return [rt.model_dump(mode="json") for rt in _svc().repository.snapshot_runtimes()]
 
 
 @router.get("/agent/v1/runtimes/summary")

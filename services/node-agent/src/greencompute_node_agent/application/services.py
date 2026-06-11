@@ -111,7 +111,7 @@ class NodeAgentService:
 
     def _rehydrate_gpu_allocator(self) -> None:
         active_states = {"accepted", "preparing", "starting", "ready"}
-        for rt in self.repository.runtimes.values():
+        for rt in self.repository.snapshot_runtimes():
             if rt.status not in active_states:
                 continue
             devices = rt.metadata.get("gpu_devices") or []
@@ -121,7 +121,7 @@ class NodeAgentService:
                 # Force allocator to treat these devices as taken by this
                 # deployment. We bypass the normal allocate() path because
                 # we already know which specific devices were assigned.
-                self.gpu_allocator._allocations[rt.deployment_id] = {int(d) for d in devices}
+                self.gpu_allocator.rehydrate(rt.deployment_id, {int(d) for d in devices})
                 logger.info(
                     "rehydrated GPU allocation: %s → %s",
                     rt.deployment_id, sorted(devices),
@@ -154,7 +154,7 @@ class NodeAgentService:
         # matches gpu_allocator.free_count exactly and is robust regardless of
         # what gpu_fraction holds.
         reserved_gpus = 0
-        for rt in self.repository.runtimes.values():
+        for rt in self.repository.snapshot_runtimes():
             if rt.status in ("accepted", "preparing", "starting", "ready"):
                 devices = rt.metadata.get("gpu_devices") or []
                 reserved_gpus += len(devices) or int(rt.metadata.get("gpu_count", 1) or 1)
@@ -283,7 +283,7 @@ class NodeAgentService:
                     logger.exception("failed to report reconciliation failure for %s", lease.deployment_id)
 
         # Clean up runtimes that are no longer ours to run.
-        for deployment_id, runtime in list(self.repository.runtimes.items()):
+        for deployment_id, runtime in self.repository.snapshot_runtime_items():
             if deployment_id in active_deployment_ids:
                 continue
             if runtime.status == "terminated":
@@ -975,7 +975,7 @@ class NodeAgentService:
         treated as "keep, reconcile later" rather than "terminate"."""
         resumed = 0
         terminated = 0
-        for deployment_id, runtime in list(self.repository.runtimes.items()):
+        for deployment_id, runtime in self.repository.snapshot_runtime_items():
             if runtime.status in ("terminated", "failed"):
                 continue
             # Check if deployment still exists on control plane.
