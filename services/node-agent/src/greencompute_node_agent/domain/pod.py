@@ -80,6 +80,26 @@ class ProcessPodBackend(PodBackend):
         image = runtime.metadata.get("image") or workload.image
         container_name = f"greencompute-pod-{runtime.deployment_id[:12]}"
 
+        # Clean up any stale container with this deterministic name before run.
+        # If the node-agent was killed between `docker run` and persisting
+        # container_id, the host container survives but the runtime record has
+        # container_id=None, so _terminate_runtime can't remove it on retry —
+        # and the bare `docker run --name` below would then fail forever with
+        # "name already in use". `docker rm -f` is idempotent (no-op if absent).
+        # Mirrors DockerInferenceBackend.start_runtime so pods self-heal too.
+        try:
+            subprocess.run(  # noqa: S603, S607
+                ["docker", "rm", "-f", container_name],
+                capture_output=True,
+                text=True,
+                timeout=30.0,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            # docker missing or rm hung — let the subsequent `docker run` be
+            # the authoritative failure.
+            pass
+
         cmd: list[str] = [
             "docker", "run", "-d",
             "--name", container_name,

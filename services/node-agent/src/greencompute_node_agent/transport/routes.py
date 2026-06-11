@@ -15,6 +15,7 @@ from greencompute_protocol import (
     MinerRegistration,
 )
 
+from greencompute_node_agent.transport.redaction import redact
 from greencompute_node_agent.transport.security import validate_auth
 
 router = APIRouter()
@@ -40,6 +41,11 @@ def _cfg():
     if _settings is None:
         raise HTTPException(status_code=503, detail="settings not initialized")
     return _settings
+
+
+def _runtime_public_dump(runtime: Any) -> dict:
+    """Serialize a runtime record with secret metadata fields redacted."""
+    return redact(runtime.model_dump(mode="json"))
 
 
 # --- Agent lifecycle endpoints ---
@@ -112,7 +118,7 @@ def list_runtimes(
     x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
 ) -> list[dict]:
     validate_auth(x_agent_auth, _cfg(), sensitive=True)
-    return [rt.model_dump(mode="json") for rt in _svc().repository.snapshot_runtimes()]
+    return [_runtime_public_dump(rt) for rt in _svc().repository.snapshot_runtimes()]
 
 
 @router.get("/agent/v1/runtimes/summary")
@@ -132,7 +138,7 @@ def get_runtime(
     runtime = _svc().repository.get_runtime(deployment_id)
     if runtime is None:
         raise HTTPException(status_code=404, detail="runtime not found")
-    return runtime.model_dump(mode="json")
+    return _runtime_public_dump(runtime)
 
 
 @router.post("/agent/v1/deployments/{deployment_id}/chat/completions")

@@ -645,11 +645,19 @@ class DockerInferenceBackend(InferenceBackend):
         else:
             image = self.default_image or artifact.payload.get("docker_image")
 
+        # Bind the serving port to the host address the node-agent reaches the
+        # container on (loopback on a host install, the private Docker bridge
+        # gateway when the agent runs in a container) — NOT 0.0.0.0. The bare
+        # `{port}:8000` form binds all host interfaces, which publishes vLLM's
+        # unauthenticated OpenAI API directly on the box's public NIC and
+        # bypasses the :8007 gateway proxy (balance/rate-limit/billing/tenancy).
+        # The gateway is the only intended ingress for inference.
+        bind_host = _docker_host()
         cmd: list[str] = [
             "docker", "run", "-d",
             "--name", container_name,
             "--shm-size", "8g",
-            "-p", f"{port}:8000",
+            "-p", f"{bind_host}:{port}:8000",
         ]
 
         # GPU passthrough — method auto-detected at startup (see gpu_docker.py)
