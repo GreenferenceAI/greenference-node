@@ -154,6 +154,18 @@ class NodeAgentService:
     def publish_capacity(self, update: CapacityUpdate) -> CapacityUpdate:
         return self.control_plane.update_capacity(update)
 
+    def _foreign_busy_devices(self) -> set[int]:
+        """GPU device indices physically in use by a NON-GreenCompute process
+        (co-tenant / squatter): busy per nvidia-smi but NOT in our own
+        allocation set. Best-effort — an empty set (probe unavailable) preserves
+        the legacy behavior. We must neither advertise nor allocate these."""
+        try:
+            from greencompute_node_agent.domain.gpu_probe import busy_gpu_devices
+            return busy_gpu_devices() - self.gpu_allocator.allocated_devices()
+        except Exception:
+            logger.debug("foreign-GPU probe failed; assuming none", exc_info=True)
+            return set()
+
     def build_capacity_update(self) -> CapacityUpdate:
         """Build a CapacityUpdate reflecting current GPU availability."""
         s = self.settings
@@ -168,7 +180,18 @@ class NodeAgentService:
             if rt.status in ("accepted", "preparing", "starting", "ready"):
                 devices = rt.metadata.get("gpu_devices") or []
                 reserved_gpus += len(devices) or int(rt.metadata.get("gpu_count", 1) or 1)
-        available_gpus = max(0, s.gpu_count - reserved_gpus)
+        # Exclude GPUs a NON-GreenCompute process is physically using (co-tenant
+        # / crypto squatter). Without this the node is "theft-blind" and would
+        # advertise stolen cards as free → the scheduler over-commits a customer
+        # onto them (the Babelbit/.24 golden-miner incident).
+        foreign = self._foreign_busy_devices()
+        if foreign:
+            logger.warning(
+                "%d GPU(s) %s on %s are in use by non-GreenCompute processes — "
+                "excluding from advertised capacity",
+                len(foreign), sorted(foreign), s.node_id,
+            )
+        available_gpus = max(0, s.gpu_count - reserved_gpus - len(foreign))
 
         # The scheduler's workload_kinds filter reads this label (exact
         # comma-separated tokens; absent = node accepts everything). Without
@@ -401,7 +424,7 @@ class NodeAgentService:
 
         # Allocate specific GPU devices
         try:
-            gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count)
+            gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count, avoid=self._foreign_busy_devices())
         except GpuAllocationError as exc:
             logger.error("GPU allocation failed for %s: %s", runtime.deployment_id, exc)
             self._fail_runtime(runtime, f"GPU allocation failed: {exc}")
@@ -594,7 +617,7 @@ class NodeAgentService:
                     runtime.deployment_id, template_name,
                 )
         try:
-            gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count)
+            gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count, avoid=self._foreign_busy_devices())
         except GpuAllocationError as exc:
             logger.error("GPU allocation failed for %s: %s", runtime.deployment_id, exc)
             self._fail_runtime(runtime, f"GPU allocation failed: {exc}")
@@ -714,7 +737,7 @@ class NodeAgentService:
         logger.info("starting VM runtime for %s (gpus: %d)", runtime.deployment_id, gpu_count)
 
         try:
-            gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count)
+            gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count, avoid=self._foreign_busy_devices())
         except GpuAllocationError as exc:
             logger.error("GPU allocation failed for %s: %s", runtime.deployment_id, exc)
             self._fail_runtime(runtime, f"GPU allocation failed: {exc}")
@@ -933,7 +956,7 @@ class NodeAgentService:
                     runtime.deployment_id, _original_devices
                 )
             else:
-                gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count)
+                gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count, avoid=self._foreign_busy_devices())
         except GpuAllocationError as exc:
             # No capacity to resume — leave it suspended; the control-plane will
             # retry. Do NOT fail/terminate (that would destroy the preserved pod).
