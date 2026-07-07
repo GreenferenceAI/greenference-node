@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import socket
 import subprocess
 import time
 from collections.abc import Iterator
@@ -262,20 +261,43 @@ class ProcessPodBackend(PodBackend):
         self,
         runtime: UnifiedRuntimeRecord,
         *,
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float = 90.0,
     ) -> bool:
-        """Wait for the pod's SSH port to be reachable. Returns True if ready."""
-        if not runtime.ssh_port:
-            return True  # No SSH port, nothing to wait for
-        host = runtime.ssh_host or "127.0.0.1"
+        """Wait until the pod's sshd is actually up. Returns True once it is.
+
+        Checks INSIDE the container via the docker socket, NOT by dialing the
+        node's public SSH host. On our providers the node can't reach its own
+        public IP (NAT hairpin), so the old `socket.create_connection(
+        (ssh_host, ssh_port))` false-negatived on EVERY pod and burned the full
+        timeout without ever verifying anything. The entrypoint installs
+        openssh (apt-get — can be slow on a cold pod) then starts sshd, so we
+        poll the container's process list until the daemon appears.
+        """
+        container = runtime.container_id
+        if not container:
+            return True  # stub / no container — nothing to verify
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
-            try:
-                with socket.create_connection((host, runtime.ssh_port), timeout=2.0):
-                    return True
-            except (ConnectionRefusedError, TimeoutError, OSError):
-                time.sleep(0.5)
+            if self._sshd_running(container):
+                return True
+            time.sleep(1.5)
         return False
+
+    @staticmethod
+    def _sshd_running(container_id: str) -> bool:
+        """True once the sshd daemon is running inside the pod. `docker top`
+        reads the container's processes host-side, so it needs no tooling in
+        the user's image and is immune to the node's own network/hairpin."""
+        try:
+            result = subprocess.run(  # noqa: S603
+                ["docker", "top", container_id],  # noqa: S607
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return False
+        return result.returncode == 0 and "sshd" in result.stdout
 
     def stop_pod(self, runtime: UnifiedRuntimeRecord) -> UnifiedRuntimeRecord:
         if runtime.container_id:

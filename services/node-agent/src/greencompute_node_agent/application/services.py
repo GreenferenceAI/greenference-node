@@ -683,15 +683,27 @@ class NodeAgentService:
             self._fail_runtime(runtime, str(exc))
             return
 
-        # Wait for SSH to be reachable before marking ready
+        # Confirm sshd actually came up before reporting the pod ready, so the
+        # customer isn't handed a pod they can't connect to. The check is
+        # host-side (docker), immune to the node's NAT-hairpin (which made the
+        # old public-IP socket check false-negative on every pod). Record the
+        # result on the runtime so a genuine SSH failure is VISIBLE to ops
+        # rather than silently reported ready.
+        ssh_verified = True
         if hasattr(self.pod_backend, "wait_for_ready"):
-            if not self.pod_backend.wait_for_ready(runtime, timeout_seconds=30.0):
-                logger.warning("pod SSH not reachable for %s after 30s, marking ready anyway", runtime.deployment_id)
+            ssh_verified = self.pod_backend.wait_for_ready(runtime, timeout_seconds=90.0)
+            if not ssh_verified:
+                logger.warning(
+                    "pod %s: sshd not confirmed up within timeout — reporting ready "
+                    "but flagging ssh_verified=false (investigate the image/entrypoint)",
+                    runtime.deployment_id,
+                )
 
         # Build endpoint with SSH connection details
         ssh_endpoint = f"ssh://{runtime.ssh_username}@{runtime.ssh_host}:{runtime.ssh_port}"
         runtime = runtime.model_copy(update={
             "endpoint": ssh_endpoint,
+            "metadata": {**runtime.metadata, "ssh_verified": ssh_verified},
         })
         self.repository.upsert_runtime(runtime)
         self._report_deployment_ready(runtime)
