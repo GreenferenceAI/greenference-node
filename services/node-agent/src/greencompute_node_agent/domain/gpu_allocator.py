@@ -49,10 +49,27 @@ class GpuAllocator:
     def used_count(self) -> int:
         return self.total_gpus - self.free_count
 
-    def allocate(self, deployment_id: str, gpu_count: int) -> list[int]:
+    def allocated_devices(self) -> set[int]:
+        """All device indices currently assigned to GreenCompute runtimes.
+        Used to tell OUR usage apart from a co-tenant/squatter's when
+        cross-checking nvidia-smi."""
+        with self._lock:
+            used: set[int] = set()
+            for devices in self._allocations.values():
+                used |= devices
+            return used
+
+    def allocate(
+        self, deployment_id: str, gpu_count: int, *, avoid: set[int] | None = None
+    ) -> list[int]:
         """Allocate gpu_count devices. Returns sorted list of device IDs.
 
-        Raises GpuAllocationError if not enough GPUs are free.
+        `avoid` is a set of device indices to treat as unavailable even though
+        GreenCompute hasn't allocated them — used to skip GPUs a
+        NON-GreenCompute process (co-tenant / crypto squatter) is physically
+        using, so we never place a customer onto a stolen card.
+
+        Raises GpuAllocationError if not enough usable GPUs are free.
         """
         if gpu_count <= 0:
             return []
@@ -60,14 +77,20 @@ class GpuAllocator:
             raise GpuAllocationError(
                 f"requested {gpu_count} GPUs but node only has {self.total_gpus}"
             )
+        avoid = avoid or set()
         # check-free + claim must be one atomic step or two threads can
         # both see the same free devices and double-allocate them.
         with self._lock:
-            free = sorted(self.free_devices)
+            free = sorted(self.free_devices - avoid)
             if len(free) < gpu_count:
+                extra = (
+                    f", {len(avoid)} in use by non-GreenCompute processes"
+                    if avoid else ""
+                )
                 raise GpuAllocationError(
-                    f"requested {gpu_count} GPUs but only {len(free)} free "
-                    f"(total={self.total_gpus}, used by {len(self._allocations)} workloads)"
+                    f"requested {gpu_count} GPUs but only {len(free)} usable free "
+                    f"(total={self.total_gpus}, used by {len(self._allocations)} "
+                    f"workloads{extra})"
                 )
             allocated = free[:gpu_count]
             self._allocations[deployment_id] = set(allocated)

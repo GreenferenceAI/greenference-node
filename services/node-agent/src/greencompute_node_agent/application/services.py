@@ -154,6 +154,18 @@ class NodeAgentService:
     def publish_capacity(self, update: CapacityUpdate) -> CapacityUpdate:
         return self.control_plane.update_capacity(update)
 
+    def _foreign_busy_devices(self) -> set[int]:
+        """GPU device indices physically in use by a NON-GreenCompute process
+        (co-tenant / squatter): busy per nvidia-smi but NOT in our own
+        allocation set. Best-effort — an empty set (probe unavailable) preserves
+        the legacy behavior. We must neither advertise nor allocate these."""
+        try:
+            from greencompute_node_agent.domain.gpu_probe import busy_gpu_devices
+            return busy_gpu_devices() - self.gpu_allocator.allocated_devices()
+        except Exception:
+            logger.debug("foreign-GPU probe failed; assuming none", exc_info=True)
+            return set()
+
     def build_capacity_update(self) -> CapacityUpdate:
         """Build a CapacityUpdate reflecting current GPU availability."""
         s = self.settings
@@ -168,7 +180,18 @@ class NodeAgentService:
             if rt.status in ("accepted", "preparing", "starting", "ready"):
                 devices = rt.metadata.get("gpu_devices") or []
                 reserved_gpus += len(devices) or int(rt.metadata.get("gpu_count", 1) or 1)
-        available_gpus = max(0, s.gpu_count - reserved_gpus)
+        # Exclude GPUs a NON-GreenCompute process is physically using (co-tenant
+        # / crypto squatter). Without this the node is "theft-blind" and would
+        # advertise stolen cards as free → the scheduler over-commits a customer
+        # onto them (the Babelbit/.24 golden-miner incident).
+        foreign = self._foreign_busy_devices()
+        if foreign:
+            logger.warning(
+                "%d GPU(s) %s on %s are in use by non-GreenCompute processes — "
+                "excluding from advertised capacity",
+                len(foreign), sorted(foreign), s.node_id,
+            )
+        available_gpus = max(0, s.gpu_count - reserved_gpus - len(foreign))
 
         # The scheduler's workload_kinds filter reads this label (exact
         # comma-separated tokens; absent = node accepts everything). Without
@@ -401,7 +424,7 @@ class NodeAgentService:
 
         # Allocate specific GPU devices
         try:
-            gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count)
+            gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count, avoid=self._foreign_busy_devices())
         except GpuAllocationError as exc:
             logger.error("GPU allocation failed for %s: %s", runtime.deployment_id, exc)
             self._fail_runtime(runtime, f"GPU allocation failed: {exc}")
@@ -594,7 +617,7 @@ class NodeAgentService:
                     runtime.deployment_id, template_name,
                 )
         try:
-            gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count)
+            gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count, avoid=self._foreign_busy_devices())
         except GpuAllocationError as exc:
             logger.error("GPU allocation failed for %s: %s", runtime.deployment_id, exc)
             self._fail_runtime(runtime, f"GPU allocation failed: {exc}")
@@ -683,15 +706,27 @@ class NodeAgentService:
             self._fail_runtime(runtime, str(exc))
             return
 
-        # Wait for SSH to be reachable before marking ready
+        # Confirm sshd actually came up before reporting the pod ready, so the
+        # customer isn't handed a pod they can't connect to. The check is
+        # host-side (docker), immune to the node's NAT-hairpin (which made the
+        # old public-IP socket check false-negative on every pod). Record the
+        # result on the runtime so a genuine SSH failure is VISIBLE to ops
+        # rather than silently reported ready.
+        ssh_verified = True
         if hasattr(self.pod_backend, "wait_for_ready"):
-            if not self.pod_backend.wait_for_ready(runtime, timeout_seconds=30.0):
-                logger.warning("pod SSH not reachable for %s after 30s, marking ready anyway", runtime.deployment_id)
+            ssh_verified = self.pod_backend.wait_for_ready(runtime, timeout_seconds=90.0)
+            if not ssh_verified:
+                logger.warning(
+                    "pod %s: sshd not confirmed up within timeout — reporting ready "
+                    "but flagging ssh_verified=false (investigate the image/entrypoint)",
+                    runtime.deployment_id,
+                )
 
         # Build endpoint with SSH connection details
         ssh_endpoint = f"ssh://{runtime.ssh_username}@{runtime.ssh_host}:{runtime.ssh_port}"
         runtime = runtime.model_copy(update={
             "endpoint": ssh_endpoint,
+            "metadata": {**runtime.metadata, "ssh_verified": ssh_verified},
         })
         self.repository.upsert_runtime(runtime)
         self._report_deployment_ready(runtime)
@@ -702,7 +737,7 @@ class NodeAgentService:
         logger.info("starting VM runtime for %s (gpus: %d)", runtime.deployment_id, gpu_count)
 
         try:
-            gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count)
+            gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count, avoid=self._foreign_busy_devices())
         except GpuAllocationError as exc:
             logger.error("GPU allocation failed for %s: %s", runtime.deployment_id, exc)
             self._fail_runtime(runtime, f"GPU allocation failed: {exc}")
@@ -921,7 +956,7 @@ class NodeAgentService:
                     runtime.deployment_id, _original_devices
                 )
             else:
-                gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count)
+                gpu_devices = self.gpu_allocator.allocate(runtime.deployment_id, gpu_count, avoid=self._foreign_busy_devices())
         except GpuAllocationError as exc:
             # No capacity to resume — leave it suspended; the control-plane will
             # retry. Do NOT fail/terminate (that would destroy the preserved pod).
