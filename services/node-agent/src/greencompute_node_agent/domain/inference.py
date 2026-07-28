@@ -546,6 +546,37 @@ def _pick_vllm_image(nvidia_smi_csv: str) -> str:
     return _VLLM_CU130_IMAGE
 
 
+def resolve_tensor_parallel_size(gpu_count: int, explicit: object = None) -> int:
+    """How many GPUs vLLM should shard the model across (--tensor-parallel-size).
+
+    This MUST match the number of GPUs handed to the container. vLLM defaults to
+    TP=1, so if we allocate 8 GPUs but never pass the flag, vLLM loads the whole
+    model onto ONE card and OOMs on anything that actually needed the other
+    seven — the other GPUs sit idle and reserved. That was the behaviour until
+    2026-07-13: the allocator reserved N devices but the flag never reached the
+    launcher, so every multi-GPU catalog model silently ran single-GPU.
+
+    An explicit override (from workload metadata) wins when it's a sane positive
+    int; otherwise we derive it from the allocated device count.
+
+    Note: vLLM requires the model's attention-head count to be divisible by this
+    value, so in practice operators should use 1/2/4/8. We pass the operator's
+    number through rather than silently rounding — a loud vLLM startup error is
+    better than quietly serving on fewer GPUs than were paid for.
+    """
+    if explicit is not None:
+        try:
+            value = int(explicit)
+            if value >= 1:
+                return value
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(1, int(gpu_count))
+    except (TypeError, ValueError):
+        return 1
+
+
 def _vllm_image_uses_json_mm_limit(image: str) -> bool:
     """vLLM >=0.10 takes the JSON form for --limit-mm-per-prompt
     (e.g. '{"image": 4}'); 0.x (the cu12 v0.8.5 image) only parses the

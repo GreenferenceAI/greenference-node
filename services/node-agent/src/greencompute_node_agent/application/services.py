@@ -32,6 +32,7 @@ from greencompute_node_agent.domain.inference import (
     LocalArtifactInferenceBackend,
     ProcessInferenceBackend,
     StagedArtifactStore,
+    resolve_tensor_parallel_size,
 )
 from greencompute_node_agent.domain.gpu_allocator import GpuAllocationError, GpuAllocator
 from greencompute_node_agent.domain.disk import detect_disk_mode
@@ -490,6 +491,14 @@ class NodeAgentService:
             "image": image,
             "docker_image": image,
             "runtime_manifest": runtime_manifest,
+            # Shard the model across every GPU we just allocated. Without this
+            # vLLM falls back to its TP=1 default and loads the whole model onto
+            # a single card — the other allocated GPUs stay idle and any model
+            # that needed them OOMs. Derived from the devices actually handed to
+            # the container; workload metadata can override.
+            "tensor_parallel_size": resolve_tensor_parallel_size(
+                len(gpu_devices), workload.metadata.get("tensor_parallel_size")
+            ),
         }
         # User-supplied HuggingFace token (gated models). When present, the
         # node-agent injects it into the container env in preference to the
