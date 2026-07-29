@@ -14,8 +14,10 @@ from greencompute_node_agent.domain.multinode_launch import (
     build_ray_start_command,
     build_worker_entrypoint,
     docker_network_flags,
+    is_worker_runtime,
     parse_multi_node_params,
     validate_params,
+    worker_health,
 )
 
 
@@ -208,6 +210,26 @@ def test_worker_command_joins_and_serves_nothing():
     script = cmd[-1]
     assert "--address=10.0.0.1" in script and "--block" in script
     assert "moonshot/kimi-k3" not in script  # workers never serve
+
+
+# --- worker liveness (workers serve no HTTP) ---------------------------------
+
+
+def test_worker_runtime_is_detected_from_metadata():
+    assert is_worker_runtime({"multi_node_role": "worker"}) is True
+    assert is_worker_runtime({"multi_node_role": "head"}) is False
+    # Ordinary single-node runtimes must never be mistaken for a worker.
+    assert is_worker_runtime({}) is False
+    assert is_worker_runtime(None) is False
+
+
+def test_worker_health_follows_the_container_not_an_endpoint():
+    # A worker has no HTTP server; probing one would fail forever and tear the
+    # rank down, rebuilding the replica in a loop.
+    up = worker_health(True, "docker-vllm-backend")
+    assert up["healthy"] is True and up["status"] == "ok" and up["role"] == "worker"
+    down = worker_health(False)
+    assert down["healthy"] is False and down["status"] == "unhealthy"
 
 
 def test_image_precedes_the_entrypoint_args():

@@ -24,9 +24,12 @@ from greencompute_node_agent.domain.model_backend import ModelBackendError, crea
 from greencompute_node_agent.domain.gpu_docker import gpu_docker_flags
 from greencompute_node_agent.domain.multinode_launch import (
     DISTRIBUTED_VLLM_ENTRY,
+    WORKER_ROLE_KEY,
     build_docker_command as build_multi_node_docker_command,
+    is_worker_runtime,
     parse_multi_node_params,
     validate_params,
+    worker_health,
 )
 
 logger = logging.getLogger(__name__)
@@ -836,7 +839,19 @@ class DockerInferenceBackend(InferenceBackend):
                 stage="start_inference_backend",
             ) from exc
 
-        runtime_url = f"http://{_docker_host()}:{port}"
+        # A worker rank serves no HTTP — it only donates GPUs to the head's Ray
+        # cluster. Deliberately leave its runtime_url unset so nothing tries to
+        # route or invoke it (the gateway only considers deployments that have
+        # an endpoint), and so the HTTP readiness path below is skipped.
+        is_worker = mn_params is not None and not mn_params.is_head
+        runtime_url = None if is_worker else f"http://{_docker_host()}:{port}"
+        extra_meta: dict[str, Any] = {}
+        if mn_params is not None:
+            extra_meta = {
+                WORKER_ROLE_KEY: mn_params.role,
+                "multi_node_rank": mn_params.rank,
+                "multi_node_replica_id": mn_params.replica_id,
+            }
         runtime = runtime.model_copy(update={
             "container_id": container_id,
             "runtime_url": runtime_url,
@@ -851,9 +866,23 @@ class DockerInferenceBackend(InferenceBackend):
                 "runtime_port": port,
                 "backend_started": True,
                 "started_at": utcnow().isoformat(),
+                **extra_meta,
             },
             "updated_at": utcnow(),
         })
+
+        if is_worker:
+            # Readiness for a worker is 'container still running', i.e. its Ray
+            # session joined and hasn't exited. Probing HTTP here would fail
+            # every time and tear the rank down, rebuilding the replica forever.
+            if not self._wait_for_container_running(runtime):
+                self.stop_runtime(runtime)
+                raise InferenceRuntimeError(
+                    f"multi-node worker rank {mn_params.rank} exited before joining the cluster",
+                    failure_class="runtime_start_failure",
+                    stage="start_inference_backend",
+                )
+            return runtime
 
         # vLLM takes time to load — wait for health
         try:
@@ -863,6 +892,33 @@ class DockerInferenceBackend(InferenceBackend):
             self.stop_runtime(runtime)
             raise
         return runtime
+
+    def _container_running(self, container_id: str | None) -> bool:
+        if not container_id:
+            return False
+        try:
+            result = subprocess.run(  # noqa: S603
+                ["docker", "inspect", "-f", "{{.State.Running}}", container_id],  # noqa: S607
+                capture_output=True,
+                text=True,
+                timeout=10.0,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return False
+        return result.returncode == 0 and result.stdout.strip().lower() == "true"
+
+    def _wait_for_container_running(
+        self, runtime: UnifiedRuntimeRecord, *, attempts: int = 6, delay: float = 5.0
+    ) -> bool:
+        """A worker joins its head's cluster in the background; give it a few
+        seconds to either settle or crash out."""
+        for attempt in range(attempts):
+            if self._container_running(runtime.container_id):
+                return True
+            if attempt < attempts - 1:
+                time.sleep(delay)
+        return False
 
     def stop_runtime(self, runtime: UnifiedRuntimeRecord) -> UnifiedRuntimeRecord:
         if runtime.container_id:
@@ -886,6 +942,12 @@ class DockerInferenceBackend(InferenceBackend):
         })
 
     def health(self, runtime: UnifiedRuntimeRecord) -> dict[str, Any]:
+        # A worker rank has no HTTP endpoint by design; its liveness is whether
+        # its container (and so its Ray session) is still up.
+        if is_worker_runtime(runtime.metadata):
+            return worker_health(
+                self._container_running(runtime.container_id), self.backend_name
+            )
         if runtime.runtime_url is None:
             return {"status": "not_started", "healthy": False}
         try:
@@ -901,6 +963,14 @@ class DockerInferenceBackend(InferenceBackend):
         runtime: UnifiedRuntimeRecord,
         payload: ChatCompletionRequest,
     ) -> ChatCompletionResponse:
+        if is_worker_runtime(runtime.metadata):
+            # Only the head rank serves. Reaching here means something routed
+            # around the endpoint filter — fail loudly rather than hang.
+            raise InferenceRuntimeError(
+                "cannot invoke a multi-node worker rank — route to the head",
+                failure_class="inference_execution_failure",
+                stage="invoke_inference",
+            )
         if runtime.runtime_url is None:
             raise InferenceRuntimeError(
                 "runtime URL missing",
