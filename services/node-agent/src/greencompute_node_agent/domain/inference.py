@@ -22,6 +22,12 @@ from pydantic import BaseModel, Field
 from greencompute_protocol import ChatCompletionRequest, ChatCompletionResponse, UnifiedRuntimeRecord
 from greencompute_node_agent.domain.model_backend import ModelBackendError, create_text_generation_backend
 from greencompute_node_agent.domain.gpu_docker import gpu_docker_flags
+from greencompute_node_agent.domain.multinode_launch import (
+    DISTRIBUTED_VLLM_ENTRY,
+    build_docker_command as build_multi_node_docker_command,
+    parse_multi_node_params,
+    validate_params,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -715,6 +721,9 @@ class DockerInferenceBackend(InferenceBackend):
         if Path(hf_cache).exists():
             cmd += ["-v", f"{hf_cache}:/root/.cache/huggingface"]
 
+        # Everything appended after this index is server arguments — the
+        # distributed rewrite below needs to separate docker flags from them.
+        image_index = len(cmd)
         cmd.append(image)
 
         if is_diffusion:
@@ -778,6 +787,33 @@ class DockerInferenceBackend(InferenceBackend):
                     cmd += ["--limit-mm-per-prompt", "image=4"]
 
             logger.info("starting vLLM container for %s: model=%s image=%s port=%d vision=%s", runtime.deployment_id, model_id, image, port, is_vision)
+
+        # Distributed replica: this node is one rank of a model served across
+        # several boxes. Rewrite the run into its head/worker form (Ray bring-up
+        # + cluster wait + serve, or join-and-block). Absent `multi_node` in the
+        # payload this is a no-op and the single-node path above is untouched.
+        mn_params = parse_multi_node_params(artifact.payload)
+        if mn_params is not None:
+            problems = validate_params(mn_params)
+            if problems:
+                raise InferenceRuntimeError(
+                    "invalid multi-node topology: " + "; ".join(problems),
+                    failure_class="runtime_start_failure",
+                    stage="start_inference_backend",
+                )
+            cmd = build_multi_node_docker_command(
+                docker_flags=cmd[:image_index],
+                image=image,
+                serve_argv=cmd[image_index + 1:],
+                params=mn_params,
+                vllm_entry=artifact.payload.get("vllm_entry") or DISTRIBUTED_VLLM_ENTRY,
+            )
+            logger.info(
+                "distributed replica %s: role=%s rank=%d/%d head=%s tp=%d pp=%d",
+                mn_params.replica_id, mn_params.role, mn_params.rank,
+                mn_params.node_count, mn_params.head_host,
+                mn_params.tensor_parallel_size, mn_params.pipeline_parallel_size,
+            )
 
         try:
             result = subprocess.run(  # noqa: S603

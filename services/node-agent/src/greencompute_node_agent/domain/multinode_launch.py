@@ -1,0 +1,262 @@
+"""Launching one node's share of a distributed (multi-node) inference replica.
+
+A model too large for one chassis is served as ONE vLLM engine spanning several
+nodes, coordinated by Ray. Each node runs the same image but plays a different
+role:
+
+  * **head** (rank 0) — starts the Ray head, waits for every worker's GPUs to
+    join, then runs `vllm serve`. This is the only node with an API server, so
+    it is the one the gateway routes inference to.
+  * **worker** (rank > 0) — joins the head's Ray cluster and blocks, donating
+    its GPUs. It serves no HTTP itself.
+
+Everything here is pure string/command building so the topology can be tested
+without a cluster. The validator's placement planner decides *which* nodes take
+which rank (see the api repo's `domain/multinode.py`); this module turns that
+decision into the commands one node actually runs.
+
+Correctness notes that cost real debugging time if missed:
+  * vLLM's world size is `tensor_parallel_size × pipeline_parallel_size`, and it
+    must equal `node_count × gpus_per_node`. A mismatch fails minutes into
+    startup with an opaque Ray placement-group error, so we check it up front.
+  * The head must not start vLLM until every worker has joined. Ray accepts the
+    head immediately, so a naive `ray start && vllm serve` races: vLLM sees only
+    the head's GPUs and dies "not enough resources". Hence the wait loop.
+  * Ray uses a spread of dynamic ports between nodes, so distributed replicas
+    need host networking. That is a deliberate trade-off, acceptable only
+    because these run on a dedicated co-located cluster — see `HOST_NETWORK_NOTE`.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+HEAD = "head"
+WORKER = "worker"
+
+# Ray's GCS port on the head. Workers dial this to join.
+DEFAULT_RAY_PORT = 6379
+# How long the head waits for workers before giving up, in seconds. Generous:
+# pulling a multi-hundred-GB model onto several boxes is slow.
+DEFAULT_CLUSTER_WAIT_SECONDS = 1800
+
+HOST_NETWORK_NOTE = (
+    "Ray allocates dynamic ports for object-manager/node-manager traffic between "
+    "peers, so distributed replicas run with host networking. Only deploy these "
+    "on a dedicated, firewalled cluster — the node's ports are exposed to its "
+    "network segment."
+)
+
+
+@dataclass(frozen=True)
+class MultiNodeParams:
+    """This node's share of a distributed replica."""
+
+    role: str  # "head" | "worker"
+    rank: int
+    head_host: str
+    tensor_parallel_size: int
+    pipeline_parallel_size: int
+    gpus_per_node: int
+    node_count: int
+    replica_id: str = ""
+    head_port: int = DEFAULT_RAY_PORT
+    cluster_wait_seconds: int = DEFAULT_CLUSTER_WAIT_SECONDS
+
+    @property
+    def is_head(self) -> bool:
+        return self.role == HEAD
+
+    @property
+    def world_size(self) -> int:
+        """GPUs vLLM expects across the whole cluster."""
+        return self.tensor_parallel_size * self.pipeline_parallel_size
+
+    @property
+    def total_gpus(self) -> int:
+        """GPUs the placement actually reserved."""
+        return self.node_count * self.gpus_per_node
+
+
+def parse_multi_node_params(payload: dict | None) -> MultiNodeParams | None:
+    """Extract distributed-replica params from an inference payload.
+
+    Returns None for an ordinary single-node deployment, so callers can keep the
+    existing path untouched. Malformed input also returns None rather than
+    raising — a broken distributed payload must not take down the agent; it
+    surfaces as the runtime failing to start.
+    """
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("multi_node")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        role = str(raw.get("role", "")).lower()
+        if role not in {HEAD, WORKER}:
+            return None
+        node_count = int(raw["node_count"])
+        gpus_per_node = int(raw["gpus_per_node"])
+        params = MultiNodeParams(
+            role=role,
+            rank=int(raw.get("rank", 0)),
+            head_host=str(raw.get("head_host", "")).strip(),
+            tensor_parallel_size=int(raw.get("tensor_parallel_size") or gpus_per_node),
+            pipeline_parallel_size=int(raw.get("pipeline_parallel_size") or node_count),
+            gpus_per_node=gpus_per_node,
+            node_count=node_count,
+            replica_id=str(raw.get("replica_id", "")),
+            head_port=int(raw.get("head_port") or DEFAULT_RAY_PORT),
+            cluster_wait_seconds=int(
+                raw.get("cluster_wait_seconds") or DEFAULT_CLUSTER_WAIT_SECONDS
+            ),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    return params
+
+
+def validate_params(params: MultiNodeParams) -> list[str]:
+    """Reasons this node can't start its share, empty when coherent."""
+    problems: list[str] = []
+    if params.node_count < 2:
+        problems.append("node_count must be >= 2 for a distributed replica")
+    if params.gpus_per_node < 1:
+        problems.append("gpus_per_node must be >= 1")
+    if params.world_size != params.total_gpus:
+        problems.append(
+            f"world size {params.tensor_parallel_size}x{params.pipeline_parallel_size}"
+            f"={params.world_size} != reserved GPUs {params.node_count}x{params.gpus_per_node}"
+            f"={params.total_gpus}"
+        )
+    if params.tensor_parallel_size > params.gpus_per_node:
+        problems.append(
+            f"tensor_parallel_size {params.tensor_parallel_size} exceeds gpus_per_node "
+            f"{params.gpus_per_node} — tensor parallelism cannot span nodes"
+        )
+    if not params.is_head and not params.head_host:
+        problems.append("worker has no head_host to join")
+    if params.is_head and params.rank != 0:
+        problems.append(f"head must be rank 0, got {params.rank}")
+    if not params.is_head and params.rank == 0:
+        problems.append("rank 0 is reserved for the head")
+    return problems
+
+
+def build_ray_start_command(params: MultiNodeParams) -> str:
+    """The `ray start` invocation for this node's role."""
+    if params.is_head:
+        return (
+            f"ray start --head --port={params.head_port} "
+            f"--num-gpus={params.gpus_per_node} --disable-usage-stats"
+        )
+    return (
+        f"ray start --address={params.head_host}:{params.head_port} "
+        f"--num-gpus={params.gpus_per_node} --disable-usage-stats"
+    )
+
+
+def build_cluster_wait_command(params: MultiNodeParams) -> str:
+    """Block until every worker's GPUs have joined the Ray cluster.
+
+    Without this the head races ahead and vLLM dies claiming insufficient
+    resources, because Ray reports the head's GPUs the instant it starts.
+    """
+    snippet = "\n".join([
+        "import ray, sys, time",
+        "ray.init(address='auto')",
+        f"expected = {params.total_gpus}",
+        f"deadline = time.time() + {params.cluster_wait_seconds}",
+        "gpus = lambda: ray.cluster_resources().get('GPU', 0)",
+        "while gpus() < expected and time.time() < deadline:",
+        "    time.sleep(5)",
+        "sys.exit(0 if gpus() >= expected else 1)",
+    ])
+    return f'python -c "{snippet}"'
+
+
+def build_distributed_vllm_flags(params: MultiNodeParams) -> list[str]:
+    """Extra `vllm serve` flags that turn a single-node launch into a Ray-backed
+    distributed one. Appended to the normal command by the caller."""
+    return [
+        "--tensor-parallel-size", str(params.tensor_parallel_size),
+        "--pipeline-parallel-size", str(params.pipeline_parallel_size),
+        "--distributed-executor-backend", "ray",
+    ]
+
+
+def build_worker_entrypoint(params: MultiNodeParams) -> list[str]:
+    """A worker joins the cluster and blocks forever donating its GPUs.
+
+    `ray start --block` keeps PID 1 alive so the container stays up; when the
+    head tears down, the worker's Ray session ends and the container exits.
+    """
+    return ["sh", "-c", f"{build_ray_start_command(params)} --block"]
+
+
+def build_head_entrypoint(params: MultiNodeParams, vllm_argv: list[str]) -> list[str]:
+    """Head: bring up Ray, wait for the full cluster, then serve.
+
+    `vllm_argv` is the ordinary single-node vLLM command; the distributed flags
+    are expected to already be part of it (see build_distributed_vllm_flags).
+    """
+    serve = " ".join(vllm_argv)
+    script = " && ".join([
+        build_ray_start_command(params),
+        build_cluster_wait_command(params),
+        serve,
+    ])
+    return ["sh", "-c", script]
+
+
+def docker_network_flags() -> list[str]:
+    """Ray peers need host networking (see HOST_NETWORK_NOTE)."""
+    return ["--network", "host"]
+
+
+# How to invoke the vLLM API server once we've overridden the image entrypoint
+# with `sh`. The module form works on both vLLM images we ship (0.8.5 cu12 and
+# 0.19.1 cu130); `vllm serve` only exists on newer builds. Overridable per
+# deployment for images that differ.
+DISTRIBUTED_VLLM_ENTRY = "python3 -m vllm.entrypoints.openai.api_server"
+
+
+def strip_port_publish(docker_flags: list[str]) -> list[str]:
+    """Drop `-p host:port:container` pairs.
+
+    Host networking and `-p` are mutually exclusive — docker refuses the run if
+    both are given. The head's API port is reachable directly on the host.
+    """
+    out: list[str] = []
+    skip_next = False
+    for flag in docker_flags:
+        if skip_next:
+            skip_next = False
+            continue
+        if flag in ("-p", "--publish"):
+            skip_next = True
+            continue
+        out.append(flag)
+    return out
+
+
+def build_docker_command(
+    *,
+    docker_flags: list[str],
+    image: str,
+    serve_argv: list[str],
+    params: MultiNodeParams,
+    vllm_entry: str = DISTRIBUTED_VLLM_ENTRY,
+) -> list[str]:
+    """Rewrite a single-node `docker run <flags> <image> <serve args>` into this
+    node's role in a distributed replica.
+
+    The image entrypoint is replaced with `sh` so we can sequence Ray bring-up,
+    the cluster wait, and the server in one container lifetime.
+    """
+    flags = strip_port_publish(docker_flags) + docker_network_flags() + ["--entrypoint", "sh"]
+    if params.is_head:
+        argv = build_head_entrypoint(params, [vllm_entry, *serve_argv])
+    else:
+        argv = build_worker_entrypoint(params)
+    # argv is ["sh", "-c", script]; the image supplies the "sh".
+    return [*flags, image, *argv[1:]]
