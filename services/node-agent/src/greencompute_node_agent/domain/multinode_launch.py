@@ -220,6 +220,33 @@ def docker_network_flags() -> list[str]:
 DISTRIBUTED_VLLM_ENTRY = "python3 -m vllm.entrypoints.openai.api_server"
 
 
+WORKER_ROLE_KEY = "multi_node_role"
+
+
+def is_worker_runtime(metadata: dict | None) -> bool:
+    """Is this runtime a non-serving rank of a distributed replica?
+
+    Workers run `ray start --block` and expose NO HTTP server, so every
+    HTTP-based readiness/health path must skip them. Without this a worker fails
+    its first health probe, gets torn down, and the replica rebuilds forever.
+    """
+    return bool(metadata) and metadata.get(WORKER_ROLE_KEY) == WORKER
+
+
+def worker_health(container_running: bool, backend_name: str = "") -> dict:
+    """Health verdict for a worker rank.
+
+    A worker's liveness is 'is its container (and therefore its Ray session)
+    still up', not 'does an endpoint answer' — it has no endpoint to answer.
+    """
+    return {
+        "status": "ok" if container_running else "unhealthy",
+        "healthy": bool(container_running),
+        "backend": backend_name,
+        "role": WORKER,
+    }
+
+
 def strip_port_publish(docker_flags: list[str]) -> list[str]:
     """Drop `-p host:port:container` pairs.
 

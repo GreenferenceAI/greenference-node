@@ -34,6 +34,7 @@ from greencompute_node_agent.domain.inference import (
     StagedArtifactStore,
     resolve_tensor_parallel_size,
 )
+from greencompute_node_agent.domain.multinode_launch import is_worker_runtime
 from greencompute_node_agent.domain.gpu_allocator import GpuAllocationError, GpuAllocator
 from greencompute_node_agent.domain.disk import detect_disk_mode
 from greencompute_node_agent.domain.pod import PodError, ProcessPodBackend, StubPodBackend
@@ -547,10 +548,19 @@ class NodeAgentService:
             self._fail_runtime(runtime, str(exc))
             return
 
+        # A worker rank of a distributed replica is READY (its GPUs have joined
+        # the head's Ray cluster) but must never be advertised as routable — it
+        # runs no API server. The gateway only considers deployments with an
+        # endpoint, so leaving it None is what keeps inference off the workers;
+        # only the head rank serves.
+        is_worker = is_worker_runtime(runtime.metadata)
         runtime = runtime.model_copy(update={
             "status": "ready",
             "current_stage": "ready",
-            "endpoint": f"{self.settings.miner_api_base_url}/inference/{runtime.deployment_id}",
+            "endpoint": (
+                None if is_worker
+                else f"{self.settings.miner_api_base_url}/inference/{runtime.deployment_id}"
+            ),
             "updated_at": _utcnow(),
         })
         self.repository.upsert_runtime(runtime)
