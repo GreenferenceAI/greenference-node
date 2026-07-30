@@ -201,6 +201,12 @@ class NodeAgentService:
         kinds = ",".join(
             k.strip().lower() for k in s.supported_workload_kinds if k.strip()
         )
+        # Operator-supplied labels (cluster_ip / interconnect_domain /
+        # interconnect_gbps drive distributed-inference placement) merge with the
+        # built-in workload_kinds label.
+        labels: dict[str, str] = dict(s.node_labels)
+        if kinds:
+            labels["workload_kinds"] = kinds
         node = NodeCapability(
             hotkey=s.miner_hotkey,
             node_id=s.node_id,
@@ -212,7 +218,7 @@ class NodeAgentService:
             memory_gb=s.memory_gb,
             performance_score=s.performance_score,
             security_tier=s.security_tier,
-            labels={"workload_kinds": kinds} if kinds else {},
+            labels=labels,
         )
         return CapacityUpdate(hotkey=s.miner_hotkey, nodes=[node])
 
