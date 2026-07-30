@@ -187,10 +187,32 @@ def build_distributed_vllm_flags(params: MultiNodeParams) -> list[str]:
 def build_worker_entrypoint(params: MultiNodeParams) -> list[str]:
     """A worker joins the cluster and blocks forever donating its GPUs.
 
-    `ray start --block` keeps PID 1 alive so the container stays up; when the
-    head tears down, the worker's Ray session ends and the container exits.
+    RETRIES the join, because `ray start --address=...` fails immediately when
+    the head's GCS isn't listening yet — and ranks start in arbitrary order: the
+    head has to pull its image and load a multi-GB model before its Ray is even
+    up. Failing fast made the worker exit, which the reconciler read as a dead
+    rank and rebuilt the replica, so head and worker thrashed and neither ever
+    came up (observed on the fleet 2026-07-30). Retrying over the same window
+    the head uses for its cluster-wait makes bring-up order-independent.
+
+    `--block` then keeps PID 1 alive; when the head tears down, the worker's Ray
+    session ends and the container exits.
     """
-    return ["sh", "-c", f"{build_ray_start_command(params)} --block"]
+    join = build_ray_start_command(params)
+    # Poll until the head accepts us or the window closes; exit non-zero on
+    # timeout so the agent reports a real failure rather than hanging forever.
+    script = (
+        f"deadline=$(( $(date +%s) + {params.cluster_wait_seconds} )); "
+        f'until {join} --block; do '
+        f'  if [ $(date +%s) -ge $deadline ]; then '
+        f'    echo "multi-node worker: head {params.head_host}:{params.head_port} '
+        f'unreachable after {params.cluster_wait_seconds}s" >&2; exit 1; '
+        f"  fi; "
+        f'  echo "waiting for ray head {params.head_host}:{params.head_port}..."; '
+        f"  sleep 10; "
+        f"done"
+    )
+    return ["sh", "-c", script]
 
 
 def build_head_entrypoint(params: MultiNodeParams, vllm_argv: list[str]) -> list[str]:
@@ -266,6 +288,28 @@ def strip_port_publish(docker_flags: list[str]) -> list[str]:
     return out
 
 
+def strip_parallelism_flags(serve_argv: list[str]) -> list[str]:
+    """Remove any parallelism flags the single-node path already added.
+
+    The ordinary launcher appends `--tensor-parallel-size N` from the allocated
+    GPU count. For a distributed replica the authoritative degrees come from the
+    topology, so drop these and let build_distributed_vllm_flags set them —
+    otherwise the flag appears twice and whichever vLLM picks last silently wins.
+    """
+    drop = {"--tensor-parallel-size", "--pipeline-parallel-size", "--distributed-executor-backend"}
+    out: list[str] = []
+    skip_next = False
+    for arg in serve_argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in drop:
+            skip_next = True
+            continue
+        out.append(arg)
+    return out
+
+
 def build_docker_command(
     *,
     docker_flags: list[str],
@@ -278,11 +322,19 @@ def build_docker_command(
     node's role in a distributed replica.
 
     The image entrypoint is replaced with `sh` so we can sequence Ray bring-up,
-    the cluster wait, and the server in one container lifetime.
+    the cluster wait, and the server in one container lifetime. The head's serve
+    command gets the topology's parallelism flags — without them vLLM defaults to
+    pipeline_parallel_size=1 and tries to load the WHOLE model onto this node's
+    GPUs, which is exactly the OOM a distributed replica exists to avoid.
     """
     flags = strip_port_publish(docker_flags) + docker_network_flags() + ["--entrypoint", "sh"]
     if params.is_head:
-        argv = build_head_entrypoint(params, [vllm_entry, *serve_argv])
+        head_argv = [
+            vllm_entry,
+            *strip_parallelism_flags(serve_argv),
+            *build_distributed_vllm_flags(params),
+        ]
+        argv = build_head_entrypoint(params, head_argv)
     else:
         argv = build_worker_entrypoint(params)
     # argv is ["sh", "-c", script]; the image supplies the "sh".

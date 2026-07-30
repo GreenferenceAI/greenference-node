@@ -7,6 +7,24 @@ import os
 from pydantic import BaseModel, Field
 
 
+def parse_node_labels(raw: str) -> dict[str, str]:
+    """Parse GREENCOMPUTE_NODE_LABELS ("k=v,k2=v2") into a label dict.
+
+    Tolerant by design: malformed pairs are skipped rather than crashing the
+    agent at import time, since a typo in an operator's env must not take a
+    miner offline.
+    """
+    labels: dict[str, str] = {}
+    for pair in (raw or "").split(","):
+        if "=" not in pair:
+            continue
+        key, _, value = pair.partition("=")
+        key, value = key.strip(), value.strip()
+        if key and value:
+            labels[key] = value
+    return labels
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -61,6 +79,19 @@ class Settings(BaseModel):
         default_factory=lambda: ["inference", "pod", "vm"]
     )
 
+    # Free-form node labels advertised to the validator, as
+    # "k=v,k2=v2" in GREENCOMPUTE_NODE_LABELS. Distributed (multi-node)
+    # inference placement reads three of these, which the validator cannot
+    # infer on its own:
+    #   cluster_ip           — the address PEERS use to reach this box on the
+    #                          cluster fabric (NOT the public IP the validator
+    #                          talks to us on; that's the wrong path for
+    #                          inter-rank traffic)
+    #   interconnect_domain  — which boxes share a fabric, so one operator's
+    #                          nodes in different datacentres are never grouped
+    #   interconnect_gbps    — advertised inter-node link speed
+    node_labels: dict[str, str] = Field(default_factory=dict)
+
     # SSH access (for pod/VM workloads)
     ssh_host: str = "127.0.0.1"
     ssh_port_range_start: int = Field(default=30000, ge=1024)
@@ -110,6 +141,7 @@ def load_settings() -> Settings:
         miner_api_base_url=os.getenv("GREENCOMPUTE_MINER_API_BASE_URL", "http://127.0.0.1:8007"),
         miner_validator_url=os.getenv("GREENCOMPUTE_MINER_VALIDATOR_URL", "http://127.0.0.1:8002"),
         node_id=os.getenv("GREENCOMPUTE_MINER_NODE_ID", default_node_id),
+        node_labels=parse_node_labels(os.getenv("GREENCOMPUTE_NODE_LABELS", "")),
         gpu_model=os.getenv("GREENCOMPUTE_GPU_MODEL", "a100"),
         gpu_count=int(os.getenv("GREENCOMPUTE_GPU_COUNT", "1")),
         available_gpus=int(os.getenv("GREENCOMPUTE_GPU_COUNT", "1")),

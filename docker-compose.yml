@@ -62,6 +62,12 @@ services:
       GREENCOMPUTE_ATTESTATION_ENABLED: "${GREENCOMPUTE_ATTESTATION_ENABLED:-false}"
       # Workload kinds
       GREENCOMPUTE_SUPPORTED_WORKLOAD_KINDS: "${GREENCOMPUTE_SUPPORTED_WORKLOAD_KINDS:-inference,pod,vm}"
+      # Free-form node labels, "k=v,k2=v2". Distributed (multi-node) inference
+      # needs cluster_ip (the address PEER NODES use to reach this box on the
+      # cluster fabric — not the public IP), interconnect_domain (which boxes
+      # share a fabric) and interconnect_gbps. Example:
+      #   cluster_ip=172.16.10.24,interconnect_domain=rack-1,interconnect_gbps=10
+      GREENCOMPUTE_NODE_LABELS: "${GREENCOMPUTE_NODE_LABELS:-}"
       # vLLM image override (per-host, useful when GPU/driver combos differ).
       # Leave blank to let node-agent auto-pick from nvidia-smi at startup.
       GREENCOMPUTE_VLLM_IMAGE: "${GREENCOMPUTE_VLLM_IMAGE:-}"
