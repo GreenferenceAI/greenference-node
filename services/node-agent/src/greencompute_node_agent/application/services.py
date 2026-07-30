@@ -408,6 +408,10 @@ class NodeAgentService:
             workload_kind=workload.kind,
             status="accepted",
             current_stage="accepted",
+            # A distributed replica's rank role arrives on the LEASE (each rank
+            # shares one workload but has its own role/rank/head_host). Stash it
+            # so _start_inference_runtime can hand it to the launcher.
+            metadata={"multi_node": lease.multi_node} if lease.multi_node else {},
         )
         self.repository.upsert_runtime(runtime)
 
@@ -507,6 +511,11 @@ class NodeAgentService:
                 len(gpu_devices), workload.metadata.get("tensor_parallel_size")
             ),
         }
+        # One rank of a distributed replica: the launcher reads this to decide
+        # head-vs-worker, Ray coordinates, and the parallelism degrees.
+        mn = (runtime.metadata or {}).get("multi_node")
+        if isinstance(mn, dict) and mn:
+            payload["multi_node"] = mn
         # User-supplied HuggingFace token (gated models). When present, the
         # node-agent injects it into the container env in preference to the
         # miner operator's own HF_TOKEN — lets a user deploy a gated model
