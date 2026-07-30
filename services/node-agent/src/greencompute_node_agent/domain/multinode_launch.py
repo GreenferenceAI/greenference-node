@@ -187,10 +187,32 @@ def build_distributed_vllm_flags(params: MultiNodeParams) -> list[str]:
 def build_worker_entrypoint(params: MultiNodeParams) -> list[str]:
     """A worker joins the cluster and blocks forever donating its GPUs.
 
-    `ray start --block` keeps PID 1 alive so the container stays up; when the
-    head tears down, the worker's Ray session ends and the container exits.
+    RETRIES the join, because `ray start --address=...` fails immediately when
+    the head's GCS isn't listening yet — and ranks start in arbitrary order: the
+    head has to pull its image and load a multi-GB model before its Ray is even
+    up. Failing fast made the worker exit, which the reconciler read as a dead
+    rank and rebuilt the replica, so head and worker thrashed and neither ever
+    came up (observed on the fleet 2026-07-30). Retrying over the same window
+    the head uses for its cluster-wait makes bring-up order-independent.
+
+    `--block` then keeps PID 1 alive; when the head tears down, the worker's Ray
+    session ends and the container exits.
     """
-    return ["sh", "-c", f"{build_ray_start_command(params)} --block"]
+    join = build_ray_start_command(params)
+    # Poll until the head accepts us or the window closes; exit non-zero on
+    # timeout so the agent reports a real failure rather than hanging forever.
+    script = (
+        f"deadline=$(( $(date +%s) + {params.cluster_wait_seconds} )); "
+        f'until {join} --block; do '
+        f'  if [ $(date +%s) -ge $deadline ]; then '
+        f'    echo "multi-node worker: head {params.head_host}:{params.head_port} '
+        f'unreachable after {params.cluster_wait_seconds}s" >&2; exit 1; '
+        f"  fi; "
+        f'  echo "waiting for ray head {params.head_host}:{params.head_port}..."; '
+        f"  sleep 10; "
+        f"done"
+    )
+    return ["sh", "-c", script]
 
 
 def build_head_entrypoint(params: MultiNodeParams, vllm_argv: list[str]) -> list[str]:

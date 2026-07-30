@@ -274,3 +274,22 @@ def test_worker_command_has_no_vllm_flags_at_all():
     script = rewrite(parse_multi_node_params(payload(role="worker", rank=1)))[-1]
     assert "--pipeline-parallel-size" not in script
     assert "--distributed-executor-backend" not in script
+
+
+# --- worker join must be order-independent -------------------------------------
+
+
+def test_worker_retries_the_join_until_the_head_is_up():
+    """Ranks start in arbitrary order and the head needs minutes (image pull +
+    model load) before its Ray GCS listens. A single `ray start --address` fails
+    instantly against a missing head; the worker then exited, the reconciler read
+    a dead rank and rebuilt, and head/worker thrashed forever."""
+    script = build_worker_entrypoint(parse_multi_node_params(payload(role="worker", rank=1)))[2]
+    assert "until" in script and "sleep" in script, "join must be retried, not one-shot"
+    assert "10.0.0.1:6379" in script
+    assert "exit 1" in script, "must eventually give up so the agent sees a real failure"
+
+
+def test_worker_join_window_matches_the_head_cluster_wait():
+    p = parse_multi_node_params(payload(role="worker", rank=1, cluster_wait_seconds=900))
+    assert "900" in build_worker_entrypoint(p)[2]
