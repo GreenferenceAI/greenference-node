@@ -8,6 +8,7 @@ from greencompute_node_agent.domain.multinode_launch import (
     DEFAULT_RAY_PORT,
     build_cluster_wait_command,
     build_docker_command,
+    strip_parallelism_flags,
     strip_port_publish,
     build_distributed_vllm_flags,
     build_head_entrypoint,
@@ -235,3 +236,41 @@ def test_worker_health_follows_the_container_not_an_endpoint():
 def test_image_precedes_the_entrypoint_args():
     cmd = rewrite(parse_multi_node_params(payload()))
     assert cmd[cmd.index("vllm/vllm-openai:v0.19.1") + 1] == "-c"
+
+
+# --- the distributed flags must reach the ACTUAL command ----------------------
+# Regression: build_distributed_vllm_flags was unit-tested in isolation but had
+# ZERO callers, so vLLM launched with pipeline_parallel_size=1 and tried to load
+# the whole model onto one node -> OOM. Assert on the final command, not the helper.
+
+
+def test_head_command_carries_pipeline_parallel_and_ray_backend():
+    script = rewrite(parse_multi_node_params(payload()))[-1]
+    assert "--pipeline-parallel-size 8" in script
+    assert "--distributed-executor-backend ray" in script
+    assert "--tensor-parallel-size 8" in script
+
+
+def test_single_node_tp_flag_is_not_duplicated():
+    # The ordinary launcher already appended --tensor-parallel-size; the topology
+    # is authoritative, so exactly one must survive.
+    cmd = build_docker_command(
+        docker_flags=["docker", "run", "-d"], image="img",
+        serve_argv=["--model", "m", "--tensor-parallel-size", "4"],
+        params=parse_multi_node_params(payload()),
+    )
+    assert cmd[-1].count("--tensor-parallel-size") == 1
+    assert "--tensor-parallel-size 8" in cmd[-1]  # topology wins, not the stale 4
+
+
+def test_strip_parallelism_flags_keeps_everything_else():
+    assert strip_parallelism_flags(
+        ["--model", "m", "--tensor-parallel-size", "4", "--max-model-len", "8192",
+         "--distributed-executor-backend", "mp"]
+    ) == ["--model", "m", "--max-model-len", "8192"]
+
+
+def test_worker_command_has_no_vllm_flags_at_all():
+    script = rewrite(parse_multi_node_params(payload(role="worker", rank=1)))[-1]
+    assert "--pipeline-parallel-size" not in script
+    assert "--distributed-executor-backend" not in script

@@ -266,6 +266,28 @@ def strip_port_publish(docker_flags: list[str]) -> list[str]:
     return out
 
 
+def strip_parallelism_flags(serve_argv: list[str]) -> list[str]:
+    """Remove any parallelism flags the single-node path already added.
+
+    The ordinary launcher appends `--tensor-parallel-size N` from the allocated
+    GPU count. For a distributed replica the authoritative degrees come from the
+    topology, so drop these and let build_distributed_vllm_flags set them —
+    otherwise the flag appears twice and whichever vLLM picks last silently wins.
+    """
+    drop = {"--tensor-parallel-size", "--pipeline-parallel-size", "--distributed-executor-backend"}
+    out: list[str] = []
+    skip_next = False
+    for arg in serve_argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in drop:
+            skip_next = True
+            continue
+        out.append(arg)
+    return out
+
+
 def build_docker_command(
     *,
     docker_flags: list[str],
@@ -278,11 +300,19 @@ def build_docker_command(
     node's role in a distributed replica.
 
     The image entrypoint is replaced with `sh` so we can sequence Ray bring-up,
-    the cluster wait, and the server in one container lifetime.
+    the cluster wait, and the server in one container lifetime. The head's serve
+    command gets the topology's parallelism flags — without them vLLM defaults to
+    pipeline_parallel_size=1 and tries to load the WHOLE model onto this node's
+    GPUs, which is exactly the OOM a distributed replica exists to avoid.
     """
     flags = strip_port_publish(docker_flags) + docker_network_flags() + ["--entrypoint", "sh"]
     if params.is_head:
-        argv = build_head_entrypoint(params, [vllm_entry, *serve_argv])
+        head_argv = [
+            vllm_entry,
+            *strip_parallelism_flags(serve_argv),
+            *build_distributed_vllm_flags(params),
+        ]
+        argv = build_head_entrypoint(params, head_argv)
     else:
         argv = build_worker_entrypoint(params)
     # argv is ["sh", "-c", script]; the image supplies the "sh".
