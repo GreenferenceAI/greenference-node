@@ -151,17 +151,46 @@ def validate_params(params: MultiNodeParams) -> list[str]:
 RAY_BOOTSTRAP = 'command -v ray >/dev/null 2>&1 || pip install -q "ray[default]"'
 
 
+# Ray sizes its object store at ~30% of system RAM unless told otherwise. On a
+# 512GB-RAM GPU box that's ~150GB, which does not fit in /dev/shm, so Ray spills
+# to /tmp — usually the small root filesystem — fills it, and the raylet dies
+# mid-startup ("Failed to get the system config from raylet because it is dead").
+# Pipeline-parallel only ships activations between stages, so a few GB is ample.
+RAY_OBJECT_STORE_BYTES = 8 * 1024**3  # 8 GiB
+# /dev/shm must comfortably exceed the object store or Ray falls back to disk.
+DISTRIBUTED_SHM_SIZE = "32g"
+
+
 def build_ray_start_command(params: MultiNodeParams) -> str:
     """The `ray start` invocation for this node's role."""
-    if params.is_head:
-        return (
-            f"ray start --head --port={params.head_port} "
-            f"--num-gpus={params.gpus_per_node} --disable-usage-stats"
-        )
-    return (
-        f"ray start --address={params.head_host}:{params.head_port} "
-        f"--num-gpus={params.gpus_per_node} --disable-usage-stats"
+    common = (
+        f"--num-gpus={params.gpus_per_node} --disable-usage-stats "
+        f"--object-store-memory={RAY_OBJECT_STORE_BYTES}"
     )
+    if params.is_head:
+        return f"ray start --head --port={params.head_port} {common}"
+    return f"ray start --address={params.head_host}:{params.head_port} {common}"
+
+
+def set_shm_size(docker_flags: list[str], size: str = DISTRIBUTED_SHM_SIZE) -> list[str]:
+    """Replace (or add) --shm-size so Ray's object store lives in /dev/shm.
+
+    The single-node default (8g) is too small once Ray is in the picture; see
+    RAY_OBJECT_STORE_BYTES for what goes wrong.
+    """
+    out: list[str] = []
+    skip_next = False
+    for flag in docker_flags:
+        if skip_next:
+            skip_next = False
+            continue
+        if flag == "--shm-size":
+            skip_next = True
+            continue
+        out.append(flag)
+    # Insert right after `docker run` so it precedes the image.
+    idx = 2 if len(out) >= 2 and out[0] == "docker" and out[1] == "run" else 0
+    return [*out[:idx], "--shm-size", size, *out[idx:]]
 
 
 def build_cluster_wait_command(params: MultiNodeParams) -> str:
@@ -341,7 +370,11 @@ def build_docker_command(
     pipeline_parallel_size=1 and tries to load the WHOLE model onto this node's
     GPUs, which is exactly the OOM a distributed replica exists to avoid.
     """
-    flags = strip_port_publish(docker_flags) + docker_network_flags() + ["--entrypoint", "sh"]
+    flags = (
+        set_shm_size(strip_port_publish(docker_flags))
+        + docker_network_flags()
+        + ["--entrypoint", "sh"]
+    )
     if params.is_head:
         head_argv = [
             vllm_entry,

@@ -8,6 +8,7 @@ from greencompute_node_agent.domain.multinode_launch import (
     DEFAULT_RAY_PORT,
     build_cluster_wait_command,
     build_docker_command,
+    set_shm_size,
     strip_parallelism_flags,
     strip_port_publish,
     build_distributed_vllm_flags,
@@ -321,3 +322,30 @@ def test_cluster_wait_uses_python3_not_python():
     container exited with no useful error (5090 cluster, 2026-07-31)."""
     cmd = build_cluster_wait_command(parse_multi_node_params(payload()))
     assert cmd.startswith("python3 -c")
+
+
+# --- Ray object store must not fill the root disk ------------------------------
+
+
+def test_ray_object_store_is_capped():
+    """Ray defaults its object store to ~30% of RAM. On a 512GB box that is
+    ~150GB, which won't fit /dev/shm, so Ray spills to /tmp on the small root
+    filesystem, fills it, and the raylet dies mid-startup (5090 cluster,
+    2026-07-31). PP only ships activations, so a few GB is plenty."""
+    for p in (payload(), payload(role="worker", rank=1)):
+        assert "--object-store-memory=" in build_ray_start_command(parse_multi_node_params(p))
+
+
+def test_distributed_containers_get_a_bigger_shm():
+    cmd = rewrite(parse_multi_node_params(payload()))
+    assert "--shm-size" in cmd
+    assert cmd[cmd.index("--shm-size") + 1] == "32g"
+    assert cmd.count("--shm-size") == 1, "must replace the 8g default, not duplicate it"
+
+
+def test_set_shm_size_replaces_and_preserves_other_flags():
+    got = set_shm_size(["docker", "run", "-d", "--shm-size", "8g", "--gpus", "all"])
+    assert got.count("--shm-size") == 1
+    assert "8g" not in got and "32g" in got
+    assert got[:2] == ["docker", "run"]  # still a docker run invocation
+    assert "-d" in got and got[-2:] == ["--gpus", "all"]  # other flags preserved
