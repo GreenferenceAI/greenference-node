@@ -161,6 +161,60 @@ RAY_OBJECT_STORE_BYTES = 8 * 1024**3  # 8 GiB
 DISTRIBUTED_SHM_SIZE = "32g"
 
 
+# Ray opens a socket per worker connection and the container default soft limit
+# is 1024. On a 256-CPU box the raylet exhausts it during vLLM startup and stops
+# accepting connections; vLLM then reports the misleading "Failed to get the
+# system config from raylet because it is dead" while raylet.err fills with
+# "File descriptor limit reached. Retrying." (5090 cluster, 2026-07-31).
+DISTRIBUTED_NOFILE = "65536:524288"
+
+# Finds the NIC carrying an address on the cluster subnet. NCCL and Gloo must be
+# pinned to it: with host networking they otherwise enumerate docker0 and every
+# br-* bridge (all 172.x, none routable between hosts) and die with "unhandled
+# system error". Pure stdlib — the vLLM image has no `ip`/`ifconfig`. Gloo also
+# rejects NCCL's "^exclude" syntax, so an explicit interface NAME is required.
+_NIC_PROBE = '''import socket,fcntl,struct,os
+p="{prefix}"
+r=""
+for i in sorted(os.listdir("/sys/class/net")):
+    try:
+        s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+        a=socket.inet_ntoa(fcntl.ioctl(s.fileno(),0x8915,struct.pack("256s",i[:15].encode()))[20:24])
+        if a.startswith(p):
+            r=i
+            break
+    except OSError:
+        pass
+print(r)
+'''
+
+
+def docker_ulimit_flags() -> list[str]:
+    """Raise the container's file-descriptor limit for Ray (see DISTRIBUTED_NOFILE)."""
+    return ["--ulimit", f"nofile={DISTRIBUTED_NOFILE}"]
+
+
+def build_nic_pin_command(head_host: str) -> str:
+    """Shell that pins NCCL/Gloo to the interface on the cluster subnet.
+
+    The probe is shipped base64-encoded: it is multi-line Python travelling
+    through `docker run -> sh -c`, and every attempt to inline it was mangled by
+    a layer of quoting. If no matching NIC is found the vars are left unset so
+    NCCL falls back to auto-detection rather than being pinned to nothing.
+    """
+    import base64
+
+    prefix = ".".join(head_host.split(".")[:3]) + "."
+    blob = base64.b64encode(_NIC_PROBE.format(prefix=prefix).encode()).decode()
+    return (
+        f"echo {blob} | base64 -d > /tmp/gc_nic.py; "
+        "GC_NIC=$(python3 /tmp/gc_nic.py); "
+        '[ -n "$GC_NIC" ] && export NCCL_SOCKET_IFNAME=$GC_NIC '
+        "GLOO_SOCKET_IFNAME=$GC_NIC NCCL_IB_DISABLE=1; "
+        'echo "greencompute: pinned NCCL/Gloo to ${GC_NIC:-auto}"'
+    )
+
+
 def build_ray_start_command(params: MultiNodeParams) -> str:
     """The `ray start` invocation for this node's role."""
     common = (
@@ -244,6 +298,7 @@ def build_worker_entrypoint(params: MultiNodeParams) -> list[str]:
     # timeout so the agent reports a real failure rather than hanging forever.
     script = (
         f"{RAY_BOOTSTRAP}; "
+        f"{build_nic_pin_command(params.head_host)}; "
         f"deadline=$(( $(date +%s) + {params.cluster_wait_seconds} )); "
         f'until {join} --block; do '
         f'  if [ $(date +%s) -ge $deadline ]; then '
@@ -266,6 +321,7 @@ def build_head_entrypoint(params: MultiNodeParams, vllm_argv: list[str]) -> list
     serve = " ".join(vllm_argv)
     script = " && ".join([
         RAY_BOOTSTRAP,
+        build_nic_pin_command(params.head_host),
         build_ray_start_command(params),
         build_cluster_wait_command(params),
         serve,
@@ -373,6 +429,7 @@ def build_docker_command(
     flags = (
         set_shm_size(strip_port_publish(docker_flags))
         + docker_network_flags()
+        + docker_ulimit_flags()
         + ["--entrypoint", "sh"]
     )
     if params.is_head:

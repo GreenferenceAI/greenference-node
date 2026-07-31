@@ -8,6 +8,8 @@ from greencompute_node_agent.domain.multinode_launch import (
     DEFAULT_RAY_PORT,
     build_cluster_wait_command,
     build_docker_command,
+    build_nic_pin_command,
+    docker_ulimit_flags,
     set_shm_size,
     strip_parallelism_flags,
     strip_port_publish,
@@ -349,3 +351,38 @@ def test_set_shm_size_replaces_and_preserves_other_flags():
     assert "8g" not in got and "32g" in got
     assert got[:2] == ["docker", "run"]  # still a docker run invocation
     assert "-d" in got and got[-2:] == ["--gpus", "all"]  # other flags preserved
+
+
+# --- fd limit + NCCL interface pinning (proven on the 5090 cluster) ------------
+
+
+def test_containers_raise_the_fd_limit():
+    """Container default is 1024 fds. On a 256-CPU box Ray exhausts it during
+    vLLM startup and the raylet stops accepting connections — surfacing as the
+    misleading "raylet is dead"."""
+    cmd = rewrite(parse_multi_node_params(payload()))
+    assert "--ulimit" in cmd
+    assert cmd[cmd.index("--ulimit") + 1].startswith("nofile=")
+
+
+def test_nccl_and_gloo_are_pinned_to_the_cluster_nic():
+    """With host networking NCCL/Gloo otherwise enumerate docker0 and every br-*
+    bridge (172.x, not routable between hosts) and die with "unhandled system
+    error". Gloo also rejects NCCL's ^exclude syntax, so a real NAME is needed."""
+    snippet = build_nic_pin_command("172.16.106.12")
+    assert "NCCL_SOCKET_IFNAME=$GC_NIC" in snippet
+    assert "GLOO_SOCKET_IFNAME=$GC_NIC" in snippet
+    assert "NCCL_IB_DISABLE=1" in snippet
+
+
+def test_nic_probe_is_base64_encoded():
+    # The probe is multi-line Python travelling through `docker run -> sh -c`;
+    # inlining it got mangled by a layer of quoting every time.
+    assert "base64 -d" in build_nic_pin_command("10.0.0.1")
+
+
+def test_both_roles_pin_the_nic_before_starting_ray():
+    for p in (payload(), payload(role="worker", rank=1)):
+        script = rewrite(parse_multi_node_params(p))[-1]
+        assert "GC_NIC" in script
+        assert script.index("GC_NIC") < script.index("ray start")
