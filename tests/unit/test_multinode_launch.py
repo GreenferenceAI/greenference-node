@@ -313,3 +313,11 @@ def test_ray_bootstrap_is_a_noop_when_already_present():
     # cu12 images bundle ray; the guard must not reinstall it every start.
     script = rewrite(parse_multi_node_params(payload()))[-1]
     assert "command -v ray >/dev/null 2>&1 ||" in script
+
+
+def test_cluster_wait_uses_python3_not_python():
+    """The vLLM cu130 image (ubuntu 24.04) has /usr/bin/python3 and NO `python`.
+    Bare `python` broke the && chain right after Ray started and the head
+    container exited with no useful error (5090 cluster, 2026-07-31)."""
+    cmd = build_cluster_wait_command(parse_multi_node_params(payload()))
+    assert cmd.startswith("python3 -c")

@@ -180,7 +180,10 @@ def build_cluster_wait_command(params: MultiNodeParams) -> str:
         "    time.sleep(5)",
         "sys.exit(0 if gpus() >= expected else 1)",
     ])
-    return f'python -c "{snippet}"'
+    # python3, NOT python: the vLLM cu130 image (ubuntu 24.04) ships only
+    # /usr/bin/python3. With bare `python` the wait silently breaks the && chain
+    # the instant Ray finishes starting, and the head container just exits.
+    return f'python3 -c "{snippet}"'
 
 
 def build_distributed_vllm_flags(params: MultiNodeParams) -> list[str]:
