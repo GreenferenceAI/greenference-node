@@ -59,3 +59,18 @@ def test_malformed_labels_never_raise():
     # A typo in an operator's env must not take the miner offline.
     for junk in ["", "no-equals", "=novalue", "key=", ",,,", None]:
         assert isinstance(parse_node_labels(junk), dict)
+
+
+# --- per-model image pin -------------------------------------------------------
+
+
+def test_image_override_beats_the_miners_auto_picked_image():
+    """Some models load on exactly one vLLM build (Kimi K3 needs one that
+    registers KimiK3ForConditionalGeneration; the stable cu130 tag does not).
+    Without a pin that wins, such a model is unservable on every node."""
+    import inspect
+    from greencompute_node_agent.domain import inference
+    src = inspect.getsource(inference.DockerInferenceBackend.start_runtime)
+    idx_override = src.index('payload.get("image_override")')
+    idx_default = src.index("self.default_image")
+    assert idx_override < idx_default, "the pin must be consulted before the miner default"

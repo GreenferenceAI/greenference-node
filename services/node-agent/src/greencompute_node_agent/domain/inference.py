@@ -683,7 +683,15 @@ class DockerInferenceBackend(InferenceBackend):
         if is_diffusion:
             image = artifact.payload.get("docker_image") or self.DIFFUSION_DEFAULT_IMAGE
         else:
-            image = self.default_image or artifact.payload.get("docker_image")
+            # A per-model pin wins over the miner's auto-picked image. The miner
+            # normally knows best (only it sees its driver/compute-cap), but a
+            # model that loads on exactly one vLLM build would otherwise be
+            # unservable no matter which node it lands on.
+            image = (
+                artifact.payload.get("image_override")
+                or self.default_image
+                or artifact.payload.get("docker_image")
+            )
 
         # Bind the serving port to the host address the node-agent reaches the
         # container on (loopback on a host install, the private Docker bridge

@@ -517,6 +517,13 @@ class NodeAgentService:
         if workload.runtime is not None and workload.runtime.max_model_len:
             payload["max_model_len"] = int(workload.runtime.max_model_len)
 
+        # A per-model image pin beats the miner's own auto-picked vLLM image.
+        # Normally the miner knows best (it alone sees its driver/compute cap),
+        # but a model that only loads on a specific build must win, or it can
+        # never be served at all.
+        if workload.runtime is not None and workload.runtime.image_override:
+            payload["image_override"] = str(workload.runtime.image_override)
+
         # One rank of a distributed replica: the launcher reads this to decide
         # head-vs-worker, Ray coordinates, and the parallelism degrees.
         mn = (runtime.metadata or {}).get("multi_node")
