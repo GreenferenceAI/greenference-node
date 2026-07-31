@@ -511,6 +511,12 @@ class NodeAgentService:
                 len(gpu_devices), workload.metadata.get("tensor_parallel_size")
             ),
         }
+        # Context window from the catalog entry. Without this vLLM falls back to
+        # the model config's native maximum and sizes its KV cache off that —
+        # fine at 32k, fatal for a 1M-context model like Kimi K3.
+        if workload.runtime is not None and workload.runtime.max_model_len:
+            payload["max_model_len"] = int(workload.runtime.max_model_len)
+
         # One rank of a distributed replica: the launcher reads this to decide
         # head-vs-worker, Ray coordinates, and the parallelism degrees.
         mn = (runtime.metadata or {}).get("multi_node")
