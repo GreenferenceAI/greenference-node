@@ -142,6 +142,15 @@ def validate_params(params: MultiNodeParams) -> list[str]:
     return problems
 
 
+# Some vLLM images ship without Ray — notably vllm/vllm-openai:*-cu130-*, which
+# is exactly the image Blackwell (5090, compute cap 12.0) auto-selects. The
+# older cu12 image bundles it, so this only pays a cost where it's missing. The
+# failure without this is a bare `sh: 1: ray: not found` and a dead rank.
+# TODO: bake Ray into a GreenCompute vLLM image so distributed ranks don't
+# pip-install on every container start (needs egress + ~40s).
+RAY_BOOTSTRAP = 'command -v ray >/dev/null 2>&1 || pip install -q "ray[default]"'
+
+
 def build_ray_start_command(params: MultiNodeParams) -> str:
     """The `ray start` invocation for this node's role."""
     if params.is_head:
@@ -202,6 +211,7 @@ def build_worker_entrypoint(params: MultiNodeParams) -> list[str]:
     # Poll until the head accepts us or the window closes; exit non-zero on
     # timeout so the agent reports a real failure rather than hanging forever.
     script = (
+        f"{RAY_BOOTSTRAP}; "
         f"deadline=$(( $(date +%s) + {params.cluster_wait_seconds} )); "
         f'until {join} --block; do '
         f'  if [ $(date +%s) -ge $deadline ]; then '
@@ -223,6 +233,7 @@ def build_head_entrypoint(params: MultiNodeParams, vllm_argv: list[str]) -> list
     """
     serve = " ".join(vllm_argv)
     script = " && ".join([
+        RAY_BOOTSTRAP,
         build_ray_start_command(params),
         build_cluster_wait_command(params),
         serve,

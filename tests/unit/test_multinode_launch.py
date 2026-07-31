@@ -293,3 +293,23 @@ def test_worker_retries_the_join_until_the_head_is_up():
 def test_worker_join_window_matches_the_head_cluster_wait():
     p = parse_multi_node_params(payload(role="worker", rank=1, cluster_wait_seconds=900))
     assert "900" in build_worker_entrypoint(p)[2]
+
+
+# --- Ray must exist in the image before we call it -----------------------------
+
+
+def test_ray_is_bootstrapped_before_use_on_both_roles():
+    """vllm/vllm-openai:*-cu130-* (what Blackwell/5090 auto-selects) ships WITHOUT
+    ray — not the CLI, not the package. Without a bootstrap the rank dies on a
+    bare `sh: 1: ray: not found` (observed on the 5090 cluster 2026-07-31)."""
+    for p in (payload(), payload(role="worker", rank=1)):
+        script = rewrite(parse_multi_node_params(p))[-1]
+        assert "pip install" in script and "ray[default]" in script
+        # the guard must come BEFORE any ray invocation
+        assert script.index("command -v ray") < script.index("ray start")
+
+
+def test_ray_bootstrap_is_a_noop_when_already_present():
+    # cu12 images bundle ray; the guard must not reinstall it every start.
+    script = rewrite(parse_multi_node_params(payload()))[-1]
+    assert "command -v ray >/dev/null 2>&1 ||" in script
