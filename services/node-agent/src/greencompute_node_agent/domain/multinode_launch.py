@@ -142,17 +142,109 @@ def validate_params(params: MultiNodeParams) -> list[str]:
     return problems
 
 
+# Some vLLM images ship without Ray — notably vllm/vllm-openai:*-cu130-*, which
+# is exactly the image Blackwell (5090, compute cap 12.0) auto-selects. The
+# older cu12 image bundles it, so this only pays a cost where it's missing. The
+# failure without this is a bare `sh: 1: ray: not found` and a dead rank.
+# TODO: bake Ray into a GreenCompute vLLM image so distributed ranks don't
+# pip-install on every container start (needs egress + ~40s).
+RAY_BOOTSTRAP = 'command -v ray >/dev/null 2>&1 || pip install -q "ray[default]"'
+
+
+# Ray sizes its object store at ~30% of system RAM unless told otherwise. On a
+# 512GB-RAM GPU box that's ~150GB, which does not fit in /dev/shm, so Ray spills
+# to /tmp — usually the small root filesystem — fills it, and the raylet dies
+# mid-startup ("Failed to get the system config from raylet because it is dead").
+# Pipeline-parallel only ships activations between stages, so a few GB is ample.
+RAY_OBJECT_STORE_BYTES = 8 * 1024**3  # 8 GiB
+# /dev/shm must comfortably exceed the object store or Ray falls back to disk.
+DISTRIBUTED_SHM_SIZE = "32g"
+
+
+# Ray opens a socket per worker connection and the container default soft limit
+# is 1024. On a 256-CPU box the raylet exhausts it during vLLM startup and stops
+# accepting connections; vLLM then reports the misleading "Failed to get the
+# system config from raylet because it is dead" while raylet.err fills with
+# "File descriptor limit reached. Retrying." (5090 cluster, 2026-07-31).
+DISTRIBUTED_NOFILE = "65536:524288"
+
+# Finds the NIC carrying an address on the cluster subnet. NCCL and Gloo must be
+# pinned to it: with host networking they otherwise enumerate docker0 and every
+# br-* bridge (all 172.x, none routable between hosts) and die with "unhandled
+# system error". Pure stdlib — the vLLM image has no `ip`/`ifconfig`. Gloo also
+# rejects NCCL's "^exclude" syntax, so an explicit interface NAME is required.
+_NIC_PROBE = '''import socket,fcntl,struct,os
+p="{prefix}"
+r=""
+for i in sorted(os.listdir("/sys/class/net")):
+    try:
+        s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+        a=socket.inet_ntoa(fcntl.ioctl(s.fileno(),0x8915,struct.pack("256s",i[:15].encode()))[20:24])
+        if a.startswith(p):
+            r=i
+            break
+    except OSError:
+        pass
+print(r)
+'''
+
+
+def docker_ulimit_flags() -> list[str]:
+    """Raise the container's file-descriptor limit for Ray (see DISTRIBUTED_NOFILE)."""
+    return ["--ulimit", f"nofile={DISTRIBUTED_NOFILE}"]
+
+
+def build_nic_pin_command(head_host: str) -> str:
+    """Shell that pins NCCL/Gloo to the interface on the cluster subnet.
+
+    The probe is shipped base64-encoded: it is multi-line Python travelling
+    through `docker run -> sh -c`, and every attempt to inline it was mangled by
+    a layer of quoting. If no matching NIC is found the vars are left unset so
+    NCCL falls back to auto-detection rather than being pinned to nothing.
+    """
+    import base64
+
+    prefix = ".".join(head_host.split(".")[:3]) + "."
+    blob = base64.b64encode(_NIC_PROBE.format(prefix=prefix).encode()).decode()
+    return (
+        f"echo {blob} | base64 -d > /tmp/gc_nic.py; "
+        "GC_NIC=$(python3 /tmp/gc_nic.py); "
+        '[ -n "$GC_NIC" ] && export NCCL_SOCKET_IFNAME=$GC_NIC '
+        "GLOO_SOCKET_IFNAME=$GC_NIC NCCL_IB_DISABLE=1; "
+        'echo "greencompute: pinned NCCL/Gloo to ${GC_NIC:-auto}"'
+    )
+
+
 def build_ray_start_command(params: MultiNodeParams) -> str:
     """The `ray start` invocation for this node's role."""
-    if params.is_head:
-        return (
-            f"ray start --head --port={params.head_port} "
-            f"--num-gpus={params.gpus_per_node} --disable-usage-stats"
-        )
-    return (
-        f"ray start --address={params.head_host}:{params.head_port} "
-        f"--num-gpus={params.gpus_per_node} --disable-usage-stats"
+    common = (
+        f"--num-gpus={params.gpus_per_node} --disable-usage-stats "
+        f"--object-store-memory={RAY_OBJECT_STORE_BYTES}"
     )
+    if params.is_head:
+        return f"ray start --head --port={params.head_port} {common}"
+    return f"ray start --address={params.head_host}:{params.head_port} {common}"
+
+
+def set_shm_size(docker_flags: list[str], size: str = DISTRIBUTED_SHM_SIZE) -> list[str]:
+    """Replace (or add) --shm-size so Ray's object store lives in /dev/shm.
+
+    The single-node default (8g) is too small once Ray is in the picture; see
+    RAY_OBJECT_STORE_BYTES for what goes wrong.
+    """
+    out: list[str] = []
+    skip_next = False
+    for flag in docker_flags:
+        if skip_next:
+            skip_next = False
+            continue
+        if flag == "--shm-size":
+            skip_next = True
+            continue
+        out.append(flag)
+    # Insert right after `docker run` so it precedes the image.
+    idx = 2 if len(out) >= 2 and out[0] == "docker" and out[1] == "run" else 0
+    return [*out[:idx], "--shm-size", size, *out[idx:]]
 
 
 def build_cluster_wait_command(params: MultiNodeParams) -> str:
@@ -171,7 +263,10 @@ def build_cluster_wait_command(params: MultiNodeParams) -> str:
         "    time.sleep(5)",
         "sys.exit(0 if gpus() >= expected else 1)",
     ])
-    return f'python -c "{snippet}"'
+    # python3, NOT python: the vLLM cu130 image (ubuntu 24.04) ships only
+    # /usr/bin/python3. With bare `python` the wait silently breaks the && chain
+    # the instant Ray finishes starting, and the head container just exits.
+    return f'python3 -c "{snippet}"'
 
 
 def build_distributed_vllm_flags(params: MultiNodeParams) -> list[str]:
@@ -202,6 +297,8 @@ def build_worker_entrypoint(params: MultiNodeParams) -> list[str]:
     # Poll until the head accepts us or the window closes; exit non-zero on
     # timeout so the agent reports a real failure rather than hanging forever.
     script = (
+        f"{RAY_BOOTSTRAP}; "
+        f"{build_nic_pin_command(params.head_host)}; "
         f"deadline=$(( $(date +%s) + {params.cluster_wait_seconds} )); "
         f'until {join} --block; do '
         f'  if [ $(date +%s) -ge $deadline ]; then '
@@ -223,6 +320,8 @@ def build_head_entrypoint(params: MultiNodeParams, vllm_argv: list[str]) -> list
     """
     serve = " ".join(vllm_argv)
     script = " && ".join([
+        RAY_BOOTSTRAP,
+        build_nic_pin_command(params.head_host),
         build_ray_start_command(params),
         build_cluster_wait_command(params),
         serve,
@@ -327,7 +426,12 @@ def build_docker_command(
     pipeline_parallel_size=1 and tries to load the WHOLE model onto this node's
     GPUs, which is exactly the OOM a distributed replica exists to avoid.
     """
-    flags = strip_port_publish(docker_flags) + docker_network_flags() + ["--entrypoint", "sh"]
+    flags = (
+        set_shm_size(strip_port_publish(docker_flags))
+        + docker_network_flags()
+        + docker_ulimit_flags()
+        + ["--entrypoint", "sh"]
+    )
     if params.is_head:
         head_argv = [
             vllm_entry,
