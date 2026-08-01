@@ -430,3 +430,29 @@ def test_head_entrypoint_neutralises_injection_in_argv():
     import shlex
     tail = shlex.split(script.split("&&")[-1])
     assert "m; touch /tmp/pwned" in tail, "must arrive as ONE argument"
+
+
+def test_entry_command_is_not_shell_quoted():
+    """`vllm_entry` is a shell FRAGMENT ("python3 -m vllm..."), not an argv
+    element. Quoting it makes sh look for a binary literally named
+    "python3 -m vllm.entrypoints.openai.api_server" and the head dies with
+    'not found' — while the arguments after it must still be quoted."""
+    from greencompute_node_agent.domain.multinode_launch import (
+        MultiNodeParams, build_docker_command, DISTRIBUTED_VLLM_ENTRY,
+    )
+    p = MultiNodeParams(
+        role="head", rank=0, head_host="10.0.0.1",
+        tensor_parallel_size=8, pipeline_parallel_size=8,
+        gpus_per_node=8, node_count=8, replica_id="r",
+    )
+    cmd = build_docker_command(
+        docker_flags=["docker", "run", "-d"], image="img",
+        serve_argv=["--model", "m", "--limit-mm-per-prompt", '{"image": 4}'],
+        params=p,
+    )
+    serve_line = cmd[-1].split("&&")[-1]
+    assert DISTRIBUTED_VLLM_ENTRY in serve_line, "entry must appear unquoted"
+    assert f"'{DISTRIBUTED_VLLM_ENTRY}'" not in serve_line, "entry must NOT be quoted"
+    # ...while a value containing a space is still protected
+    import shlex
+    assert '{"image": 4}' in shlex.split(serve_line)

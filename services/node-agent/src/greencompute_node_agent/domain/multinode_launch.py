@@ -313,20 +313,31 @@ def build_worker_entrypoint(params: MultiNodeParams) -> list[str]:
     return ["sh", "-c", script]
 
 
-def build_head_entrypoint(params: MultiNodeParams, vllm_argv: list[str]) -> list[str]:
+def build_head_entrypoint(
+    params: MultiNodeParams,
+    vllm_argv: list[str],
+    vllm_entry: str = "",
+) -> list[str]:
     """Head: bring up Ray, wait for the full cluster, then serve.
 
-    `vllm_argv` is the ordinary single-node vLLM command; the distributed flags
-    are expected to already be part of it (see build_distributed_vllm_flags).
+    `vllm_argv` is the ordinary single-node vLLM ARGUMENT list; the distributed
+    flags are expected to already be part of it (see
+    build_distributed_vllm_flags).
 
-    The argv is shell-QUOTED, not naively joined: this string is handed to
+    The arguments are shell-QUOTED, not naively joined: this string is handed to
     `sh -c`, so any argument containing a space or quote would otherwise be
     re-split by the shell. That was already silently corrupting vision models
     (`--limit-mm-per-prompt '{"image": 4}'` arrived as two mangled arguments),
     and it is a command-injection vector now that operators can supply
     `extra_engine_args` from the catalog.
+
+    `vllm_entry` is deliberately NOT quoted: it is a shell fragment, not an
+    argument ("python3 -m vllm.entrypoints.openai.api_server"). Quoting it would
+    make the shell look for a single binary with spaces in its name.
     """
     serve = " ".join(shlex.quote(a) for a in vllm_argv)
+    if vllm_entry:
+        serve = f"{vllm_entry} {serve}"
     script = " && ".join([
         RAY_BOOTSTRAP,
         build_nic_pin_command(params.head_host),
@@ -442,11 +453,10 @@ def build_docker_command(
     )
     if params.is_head:
         head_argv = [
-            vllm_entry,
             *strip_parallelism_flags(serve_argv),
             *build_distributed_vllm_flags(params),
         ]
-        argv = build_head_entrypoint(params, head_argv)
+        argv = build_head_entrypoint(params, head_argv, vllm_entry=vllm_entry)
     else:
         argv = build_worker_entrypoint(params)
     # argv is ["sh", "-c", script]; the image supplies the "sh".
