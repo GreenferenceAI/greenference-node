@@ -524,6 +524,15 @@ class NodeAgentService:
         if workload.runtime is not None and workload.runtime.image_override:
             payload["image_override"] = str(workload.runtime.image_override)
 
+        # Long tail of per-model engine tuning from the catalog. Kimi K3 on
+        # sm_120 needs `--moe-backend marlin` (vLLM's auto oracle picks
+        # DeepGEMM, which has no sm_120 branch and hard-asserts) plus raised
+        # distributed timeouts. Values are validated protocol-side.
+        if workload.runtime is not None and workload.runtime.extra_engine_args:
+            payload["extra_engine_args"] = [str(a) for a in workload.runtime.extra_engine_args]
+        if workload.runtime is not None and workload.runtime.extra_env:
+            payload["extra_env"] = {str(k): str(v) for k, v in workload.runtime.extra_env.items()}
+
         # One rank of a distributed replica: the launcher reads this to decide
         # head-vs-worker, Ray coordinates, and the parallelism degrees.
         mn = (runtime.metadata or {}).get("multi_node")

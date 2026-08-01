@@ -28,6 +28,7 @@ Correctness notes that cost real debugging time if missed:
 """
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
 
 HEAD = "head"
@@ -317,8 +318,15 @@ def build_head_entrypoint(params: MultiNodeParams, vllm_argv: list[str]) -> list
 
     `vllm_argv` is the ordinary single-node vLLM command; the distributed flags
     are expected to already be part of it (see build_distributed_vllm_flags).
+
+    The argv is shell-QUOTED, not naively joined: this string is handed to
+    `sh -c`, so any argument containing a space or quote would otherwise be
+    re-split by the shell. That was already silently corrupting vision models
+    (`--limit-mm-per-prompt '{"image": 4}'` arrived as two mangled arguments),
+    and it is a command-injection vector now that operators can supply
+    `extra_engine_args` from the catalog.
     """
-    serve = " ".join(vllm_argv)
+    serve = " ".join(shlex.quote(a) for a in vllm_argv)
     script = " && ".join([
         RAY_BOOTSTRAP,
         build_nic_pin_command(params.head_host),

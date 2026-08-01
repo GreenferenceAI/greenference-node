@@ -732,6 +732,13 @@ class DockerInferenceBackend(InferenceBackend):
         if Path(hf_cache).exists():
             cmd += ["-v", f"{hf_cache}:/root/.cache/huggingface"]
 
+        # Per-model environment from the catalog. Must land among the DOCKER
+        # flags (before image_index) so the distributed rewrite carries it into
+        # every rank container — a rank whose env differs from its peers'
+        # deadlocks the collective rather than failing cleanly.
+        for key, value in (artifact.payload.get("extra_env") or {}).items():
+            cmd += ["-e", f"{key}={value}"]
+
         # Everything appended after this index is server arguments — the
         # distributed rewrite below needs to separate docker flags from them.
         image_index = len(cmd)
@@ -796,6 +803,16 @@ class DockerInferenceBackend(InferenceBackend):
                     cmd += ["--limit-mm-per-prompt", '{"image": 4}']
                 else:
                     cmd += ["--limit-mm-per-prompt", "image=4"]
+
+            # Per-model engine tuning from the catalog, appended last so it can
+            # override anything we derived above. Kimi K3 on sm_120 needs
+            # `--moe-backend marlin` (the auto oracle picks DeepGEMM, which has
+            # no sm_120 branch and hard-asserts) and raised distributed
+            # timeouts; modelling every such knob as a first-class field would
+            # never keep up. Validated in the protocol layer.
+            extra_args = artifact.payload.get("extra_engine_args") or []
+            if extra_args:
+                cmd += [str(a) for a in extra_args]
 
             logger.info("starting vLLM container for %s: model=%s image=%s port=%d vision=%s", runtime.deployment_id, model_id, image, port, is_vision)
 

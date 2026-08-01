@@ -386,3 +386,47 @@ def test_both_roles_pin_the_nic_before_starting_ray():
         script = rewrite(parse_multi_node_params(p))[-1]
         assert "GC_NIC" in script
         assert script.index("GC_NIC") < script.index("ray start")
+
+
+# --- shell quoting + per-model engine passthrough (2026-08-01) ----------------
+
+
+def test_head_entrypoint_shell_quotes_its_argv():
+    """The head's argv is embedded in a `sh -c` script, so an argument
+    containing a space MUST survive as one argument.
+
+    This was already corrupting vision models before any operator input
+    existed: `--limit-mm-per-prompt '{"image": 4}'` was naively joined and the
+    shell re-split it into `{"image":` and `4}`.
+    """
+    from greencompute_node_agent.domain.multinode_launch import (
+        MultiNodeParams, build_head_entrypoint,
+    )
+    p = MultiNodeParams(
+        replica_id="r", role="head", rank=0, head_host="10.0.0.1",
+        tensor_parallel_size=8, pipeline_parallel_size=2,
+        node_count=2, gpus_per_node=8,
+    )
+    argv = ["--model", "m", "--limit-mm-per-prompt", '{"image": 4}']
+    script = build_head_entrypoint(p, argv)[-1]
+    assert "'{\"image\": 4}'" in script or '"{\\"image\\": 4}"' in script, script
+    # and shlex must be able to round-trip the serve segment back to the argv
+    import shlex
+    assert '{"image": 4}' in shlex.split(script.split("&&")[-1])
+
+
+def test_head_entrypoint_neutralises_injection_in_argv():
+    from greencompute_node_agent.domain.multinode_launch import (
+        MultiNodeParams, build_head_entrypoint,
+    )
+    p = MultiNodeParams(
+        replica_id="r", role="head", rank=0, head_host="10.0.0.1",
+        tensor_parallel_size=8, pipeline_parallel_size=2,
+        node_count=2, gpus_per_node=8,
+    )
+    script = build_head_entrypoint(p, ["--model", "m; touch /tmp/pwned"])[-1]
+    # the semicolon must be inside quotes, not a command separator
+    assert "; touch /tmp/pwned" not in script.replace("'", "")[len("x"):] or "'" in script
+    import shlex
+    tail = shlex.split(script.split("&&")[-1])
+    assert "m; touch /tmp/pwned" in tail, "must arrive as ONE argument"
