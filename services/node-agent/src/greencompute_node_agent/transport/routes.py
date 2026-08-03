@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 from typing import Any
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
@@ -17,6 +19,14 @@ from greencompute_protocol import (
 
 from greencompute_node_agent.transport.redaction import redact
 from greencompute_node_agent.transport.security import validate_auth
+
+# How long to wait on the model's own response. The previous 120s was tuned for
+# small models; a reasoning model on a distributed replica emits ~6 tok/s, so a
+# 600-token answer alone takes ~100s and a longer one exceeded the limit and
+# surfaced as a bare 502. Overridable per node.
+INFERENCE_PROXY_TIMEOUT_SECONDS = float(
+    os.environ.get("GREENCOMPUTE_INFERENCE_PROXY_TIMEOUT_SECONDS", "600")
+)
 
 router = APIRouter()
 
@@ -222,7 +232,17 @@ async def inference_proxy(
     upstream_req = urllib_request.Request(upstream_url, data=body, method="POST")
     upstream_req.add_header("content-type", "application/json")
     try:
-        resp = urllib_request.urlopen(upstream_req, timeout=120.0)  # noqa: S310
+        # MUST run off the event loop. urlopen is blocking, and this handler is
+        # `async def`, so calling it directly froze the WHOLE agent for the
+        # duration of the upstream call — no /healthz, no capacity reports,
+        # nothing. On fast models that is ~1s and invisible; on a big model it
+        # is ~50s, during which the gateway's pre-flight health probe times out
+        # and it rejects every other request with "no healthy deployment
+        # available". That is a concurrency ceiling of ONE, independent of the
+        # engine's own max_num_seqs.
+        resp = await asyncio.to_thread(
+            urllib_request.urlopen, upstream_req, timeout=INFERENCE_PROXY_TIMEOUT_SECONDS
+        )
     except (HTTPError, URLError, TimeoutError) as exc:
         raise HTTPException(status_code=502, detail=f"upstream error: {exc}") from exc
 
