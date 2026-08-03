@@ -168,7 +168,9 @@ def test_distributed_flags_use_the_ray_backend():
 
 
 def test_distributed_replicas_use_host_networking():
-    assert docker_network_flags() == ["--network", "host"]
+    # Host IPC rides along with host networking: vLLM's API-server <-> engine
+    # handshake and Ray's plasma store are both shared-memory transports.
+    assert docker_network_flags() == ["--network", "host", "--ipc=host"]
 
 
 # --- docker command rewrite --------------------------------------------------
@@ -456,3 +458,40 @@ def test_entry_command_is_not_shell_quoted():
     # ...while a value containing a space is still protected
     import shlex
     assert '{"image": 4}' in shlex.split(serve_line)
+
+
+# --- vLLM must advertise the cluster NIC too (2026-08-03) ---------------------
+
+
+def test_nic_pin_exports_vllm_host_ip_not_just_nccl():
+    """Pinning NCCL/Gloo is NOT enough.
+
+    vLLM chooses its own advertised address independently of
+    NCCL_SOCKET_IFNAME. With --network host these boxes expose docker0 and
+    several br-* bridges, so unset it can bind an address peers cannot reach:
+    the engine-core handshake fails with a bare "Engine core initialization
+    failed" while NCCL looks perfectly healthy. Manual runs that set
+    VLLM_HOST_IP worked; the agent path, which did not, failed every time.
+    """
+    from greencompute_node_agent.domain.multinode_launch import build_nic_pin_command
+    cmd = build_nic_pin_command("172.16.106.13")
+    assert "VLLM_HOST_IP" in cmd, "vLLM would pick an arbitrary interface"
+    assert "NCCL_SOCKET_IFNAME" in cmd and "GLOO_SOCKET_IFNAME" in cmd
+
+
+def test_nic_probe_emits_both_interface_and_address():
+    import base64, re
+    from greencompute_node_agent.domain.multinode_launch import build_nic_pin_command
+    cmd = build_nic_pin_command("172.16.106.13")
+    blob = re.search(r"echo ([A-Za-z0-9+/=]+) \| base64 -d", cmd).group(1)
+    probe = base64.b64decode(blob).decode()
+    # the probe must carry the ADDRESS through, not just the interface name
+    assert 'r=i+" "+a' in probe, "probe discards the address VLLM_HOST_IP needs"
+    assert '172.16.106.' in probe
+
+
+def test_distributed_containers_get_host_ipc():
+    """Shared-memory transports (vLLM handshake, Ray plasma) need the host IPC
+    namespace; --shm-size alone does not substitute for it."""
+    from greencompute_node_agent.domain.multinode_launch import docker_network_flags
+    assert "--ipc=host" in docker_network_flags()

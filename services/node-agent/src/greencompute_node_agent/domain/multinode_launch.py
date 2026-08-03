@@ -182,7 +182,7 @@ for i in sorted(os.listdir("/sys/class/net")):
         s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
         a=socket.inet_ntoa(fcntl.ioctl(s.fileno(),0x8915,struct.pack("256s",i[:15].encode()))[20:24])
         if a.startswith(p):
-            r=i
+            r=i+" "+a
             break
     except OSError:
         pass
@@ -196,12 +196,22 @@ def docker_ulimit_flags() -> list[str]:
 
 
 def build_nic_pin_command(head_host: str) -> str:
-    """Shell that pins NCCL/Gloo to the interface on the cluster subnet.
+    """Shell that pins NCCL/Gloo AND vLLM to the interface on the cluster subnet.
 
     The probe is shipped base64-encoded: it is multi-line Python travelling
     through `docker run -> sh -c`, and every attempt to inline it was mangled by
     a layer of quoting. If no matching NIC is found the vars are left unset so
     NCCL falls back to auto-detection rather than being pinned to nothing.
+
+    VLLM_HOST_IP matters as much as the NCCL vars and is easy to miss: with
+    `--network host` these boxes expose docker0 plus several br-* bridges, and
+    vLLM picks its own advertised address independently of NCCL_SOCKET_IFNAME.
+    Unset, the engine-core handshake can bind an address its peers cannot reach
+    and startup dies with a bare "Engine core initialization failed" whose real
+    cause is buried under one RayExecutorV2 shutdown traceback PER RANK. NCCL
+    itself looks healthy throughout, which makes it doubly misleading. The probe
+    already resolved this interface's address, so emit it as `<name> <addr>`
+    and use both.
     """
     import base64
 
@@ -209,10 +219,14 @@ def build_nic_pin_command(head_host: str) -> str:
     blob = base64.b64encode(_NIC_PROBE.format(prefix=prefix).encode()).decode()
     return (
         f"echo {blob} | base64 -d > /tmp/gc_nic.py; "
-        "GC_NIC=$(python3 /tmp/gc_nic.py); "
+        "GC_OUT=$(python3 /tmp/gc_nic.py); "
+        'GC_NIC=$(echo "$GC_OUT" | cut -d" " -f1); '
+        'GC_IP=$(echo "$GC_OUT" | cut -d" " -f2); '
         '[ -n "$GC_NIC" ] && export NCCL_SOCKET_IFNAME=$GC_NIC '
         "GLOO_SOCKET_IFNAME=$GC_NIC NCCL_IB_DISABLE=1; "
-        'echo "greencompute: pinned NCCL/Gloo to ${GC_NIC:-auto}"'
+        '[ -n "$GC_IP" ] && export VLLM_HOST_IP=$GC_IP; '
+        'echo "greencompute: pinned NCCL/Gloo to ${GC_NIC:-auto}, '
+        'VLLM_HOST_IP=${GC_IP:-auto}"'
     )
 
 
@@ -349,8 +363,13 @@ def build_head_entrypoint(
 
 
 def docker_network_flags() -> list[str]:
-    """Ray peers need host networking (see HOST_NETWORK_NOTE)."""
-    return ["--network", "host"]
+    """Ray peers need host networking (see HOST_NETWORK_NOTE).
+
+    `--ipc=host` goes with it: vLLM's API-server <-> engine-core handshake and
+    Ray's plasma store both use shared memory, and a private IPC namespace
+    limits what they can map regardless of --shm-size.
+    """
+    return ["--network", "host", "--ipc=host"]
 
 
 # How to invoke the vLLM API server once we've overridden the image entrypoint
