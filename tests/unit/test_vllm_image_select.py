@@ -56,3 +56,52 @@ def test_unparseable_output_falls_back_to_cu130():
     assert _pick_vllm_image("") == _VLLM_CU130_IMAGE
     assert _pick_vllm_image("garbage") == _VLLM_CU130_IMAGE
     assert _pick_vllm_image("N/A, N/A") == _VLLM_CU130_IMAGE
+
+
+# --- HF cache must be mounted from the HOST path (2026-08-03) -----------------
+
+
+def _mount_source(env, monkeypatch, tmp_path):
+    """Return the bind-mount SOURCE the agent would use for the HF cache."""
+    import os
+    from pathlib import Path
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    container_view = env.get("HF_HOME", "")
+    # emulate the agent's decision (mirrors DockerInferenceBackend.start_runtime)
+    host = os.environ.get("GREENCOMPUTE_HF_CACHE_HOST_PATH") or container_view
+    return host if Path(container_view).exists() else None
+
+
+def test_mount_source_is_the_host_path_not_the_agents_own_view(monkeypatch, tmp_path):
+    """Regression for a fleet-wide bug (2026-08-03).
+
+    The agent runs in a container where HF_HOME=/root/.cache/huggingface, but a
+    bind-mount source is resolved by the docker daemon on the HOST. Using
+    HF_HOME as the source mounted the host's small root filesystem into every
+    inference container, so every model was re-downloaded into it — filling
+    98G root disks fleet-wide with partial weights, and making a 1.5TB model
+    impossible to start.
+    """
+    src = _mount_source(
+        {"HF_HOME": str(tmp_path), "GREENCOMPUTE_HF_CACHE_HOST_PATH": "/data/hf-cache"},
+        monkeypatch, tmp_path,
+    )
+    assert src == "/data/hf-cache", "must mount the host cache, not the agent's view"
+
+
+def test_falls_back_to_hf_home_when_not_containerised(monkeypatch, tmp_path):
+    # Agent running directly on the host: the two paths are the same thing.
+    monkeypatch.delenv("GREENCOMPUTE_HF_CACHE_HOST_PATH", raising=False)
+    src = _mount_source({"HF_HOME": str(tmp_path)}, monkeypatch, tmp_path)
+    assert src == str(tmp_path)
+
+
+def test_agent_source_actually_reads_the_host_path_var():
+    import inspect
+    from greencompute_node_agent.domain import inference
+    src = inspect.getsource(inference.DockerInferenceBackend.start_runtime)
+    assert "GREENCOMPUTE_HF_CACHE_HOST_PATH" in src
+    idx_host = src.index("GREENCOMPUTE_HF_CACHE_HOST_PATH")
+    idx_mount = src.index('/root/.cache/huggingface"]')
+    assert idx_host < idx_mount, "host path must be resolved before the mount is built"

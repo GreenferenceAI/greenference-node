@@ -57,6 +57,12 @@ services:
       # HuggingFace (for vLLM model downloads)
       HF_TOKEN: "${HF_TOKEN:-}"
       HF_HOME: /root/.cache/huggingface
+      # The cache path as the HOST sees it. The agent bind-mounts the cache into
+      # every inference container it launches, and the docker daemon resolves
+      # that source on the host — so it must NOT be the in-container HF_HOME
+      # above, or containers get the host's root filesystem and re-download
+      # every model into it.
+      GREENCOMPUTE_HF_CACHE_HOST_PATH: "${HF_HOME:-~/.cache/huggingface}"
       # Security
       GREENCOMPUTE_SECURITY_TIER: "${GREENCOMPUTE_SECURITY_TIER:-standard}"
       GREENCOMPUTE_ATTESTATION_ENABLED: "${GREENCOMPUTE_ATTESTATION_ENABLED:-false}"

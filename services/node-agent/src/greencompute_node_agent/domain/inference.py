@@ -727,10 +727,28 @@ class DockerInferenceBackend(InferenceBackend):
             cmd += ["-e", f"HUGGING_FACE_HUB_TOKEN={hf_token}"]
             cmd += ["-e", f"HF_TOKEN={hf_token}"]
 
-        # Mount HuggingFace cache for faster repeated loads
-        hf_cache = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
-        if Path(hf_cache).exists():
-            cmd += ["-v", f"{hf_cache}:/root/.cache/huggingface"]
+        # Mount the HuggingFace cache so models are not re-downloaded.
+        #
+        # The SOURCE of a bind mount is resolved by the docker daemon on the
+        # HOST, but this agent runs inside a container where HF_HOME is its own
+        # in-container path (/root/.cache/huggingface). Using HF_HOME as the
+        # source therefore mounted the HOST's /root/.cache/huggingface — the
+        # small root filesystem — instead of the real cache volume. Every model
+        # was re-downloaded into it, which is how 98G root disks filled up with
+        # partial weights across the fleet, and why a 1.5TB model could never
+        # start at all. GREENCOMPUTE_HF_CACHE_HOST_PATH carries the true host
+        # path; HF_HOME stays the fallback for agents running outside a
+        # container, where the two are the same thing.
+        hf_cache_container = os.environ.get(
+            "HF_HOME", os.path.expanduser("~/.cache/huggingface")
+        )
+        hf_cache_host = (
+            os.environ.get("GREENCOMPUTE_HF_CACHE_HOST_PATH") or hf_cache_container
+        )
+        # Existence is checked against OUR view of it; the host path is only
+        # meaningful to the daemon.
+        if Path(hf_cache_container).exists():
+            cmd += ["-v", f"{hf_cache_host}:/root/.cache/huggingface"]
 
         # Per-model environment from the catalog. Must land among the DOCKER
         # flags (before image_index) so the distributed rewrite carries it into
