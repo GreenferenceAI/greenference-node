@@ -21,6 +21,12 @@ services:
       - ${BITTENSOR_WALLET_DIR:-~/.bittensor}:/root/.bittensor:ro
       - node-volumes:/tmp/greencompute-node-volumes
       - node-artifacts:/tmp/greencompute-node-artifacts
+      # Runtime state MUST live on a volume. It used to sit in the
+      # container's writable layer, so replacing the agent container
+      # (compose up --force-recreate, an image bump) erased its record of
+      # every running workload: it then saw its OWN containers as foreign
+      # GPU squatters, could not reap them, and could not re-allocate.
+      - node-state:/var/lib/greencompute
       - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
     environment:
       GREENCOMPUTE_ENABLE_BACKGROUND_WORKERS: "true"
@@ -88,7 +94,7 @@ services:
       GREENCOMPUTE_SSH_PORT_RANGE_END: "${GREENCOMPUTE_SSH_PORT_RANGE_END:-31000}"
       # Persistence
       GREENCOMPUTE_HOST_REPO_DIR: ${PWD}
-      GREENCOMPUTE_RUNTIME_STATE_PATH: /tmp/greencompute-node-runtime-state.json
+      GREENCOMPUTE_RUNTIME_STATE_PATH: /var/lib/greencompute/runtime-state.json
       GREENCOMPUTE_VOLUME_BASE_DIR: /tmp/greencompute-node-volumes
       GREENCOMPUTE_ARTIFACT_CACHE_DIR: /tmp/greencompute-node-artifacts
       # PYTHONPATH
@@ -126,3 +132,4 @@ services:
 volumes:
   node-volumes:
   node-artifacts:
+  node-state:

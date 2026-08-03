@@ -123,3 +123,27 @@ def test_liveness_is_scoped_to_inference_not_pods_or_vms():
     from greencompute_node_agent.application import services
     src = inspect.getsource(services.NodeAgentService._check_runtime_liveness)
     assert "WorkloadKind.INFERENCE" in src
+
+
+# --- runtime state must survive container replacement (2026-08-03) -----------
+
+
+def test_runtime_state_is_stored_on_a_mounted_volume():
+    """The agent's record of what it is running lived in the container's
+    writable layer, so replacing the agent container erased it.
+
+    The agent then saw its OWN inference containers as foreign GPU squatters
+    ("8 GPUs in use by non-GreenCompute processes ... used by 0 workloads"),
+    refused to allocate, and could not reap them — which is also how containers
+    ended up orphaned after a teardown.
+    """
+    import pathlib, re
+    compose = (pathlib.Path(__file__).resolve().parents[2] / "docker-compose.yml").read_text()
+    m = re.search(r"GREENCOMPUTE_RUNTIME_STATE_PATH:\s*(\S+)", compose)
+    assert m, "state path not configured"
+    state_path = m.group(1)
+    mounts = re.findall(r"^\s+- [\w.${}:/~-]+:(/[\w./-]+)", compose, re.M)
+    assert any(state_path.startswith(mnt.rstrip("/") + "/") for mnt in mounts), (
+        f"{state_path} is not inside any mounted volume {mounts} — "
+        "it would be lost when the agent container is replaced"
+    )
