@@ -34,6 +34,12 @@ from greencompute_node_agent.domain.inference import (
     StagedArtifactStore,
     resolve_tensor_parallel_size,
 )
+from greencompute_node_agent.domain.liveness import (
+    ALIVE,
+    SUSPECT,
+    next_failure_count,
+    rank_liveness,
+)
 from greencompute_node_agent.domain.multinode_launch import is_worker_runtime
 from greencompute_node_agent.domain.gpu_allocator import GpuAllocationError, GpuAllocator
 from greencompute_node_agent.domain.disk import detect_disk_mode
@@ -55,6 +61,8 @@ class NodeAgentService:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        # deployment_id -> consecutive liveness probe failures (see domain/liveness)
+        self._liveness_failures: dict[str, int] = {}
         self.repository = NodeAgentRepository(state_path=settings.runtime_state_path)
         self.control_plane = ControlPlaneHTTPClient(
             base_url=settings.control_plane_url,
@@ -320,8 +328,17 @@ class NodeAgentService:
                     )
                     self._terminate_runtime(existing, reason="stuck_retry", report=False)
                     self.repository.remove_runtime(lease.deployment_id)
+                elif existing.status == "ready":
+                    # A `ready` runtime used to be skipped forever, so a
+                    # container that died later stayed `ready` and nobody ever
+                    # noticed. Re-check liveness every cycle and report death,
+                    # which is what lets the validator rebuild a dead replica.
+                    if self._check_runtime_liveness(existing):
+                        continue  # still alive
+                    # Dead: fall through to re-dispatch below.
+                    self.repository.remove_runtime(lease.deployment_id)
                 else:
-                    continue  # Already completed (ready/failed/terminated)
+                    continue  # Already completed (failed/terminated)
             try:
                 self._reconcile_workload(lease)
             except Exception:
@@ -875,6 +892,74 @@ class NodeAgentService:
             ))
         except ControlPlaneHTTPError:
             logger.exception("failed to report failure for %s", runtime.deployment_id)
+
+    def _check_runtime_liveness(self, runtime: UnifiedRuntimeRecord) -> bool:
+        """Is this already-`ready` runtime still actually alive?
+
+        Returns True to leave it alone. On a DEAD verdict it tears the runtime
+        down and reports FAILED, which is the signal the validator needs: for a
+        distributed replica every rank previously stayed `ready` after the
+        containers had exited, so `replica_action()` kept returning KEEP and a
+        single node fault became a permanent outage.
+
+        Deliberately conservative — see domain/liveness. A missing container is
+        proof; an unanswered endpoint only counts after several consecutive
+        misses, because a false positive here destroys a healthy replica.
+        """
+        # Scoped to inference: pods and VMs have their own lifecycle semantics
+        # (a stopped pod is often intentional), and wrongly reaping a tenant's
+        # pod would be far worse than the bug this fixes.
+        kind = runtime.workload_kind
+        if kind not in (WorkloadKind.INFERENCE, "inference"):
+            return True
+        backend = self.inference_backend
+        try:
+            container_running = True
+            endpoint_healthy: bool | None = None
+            verdict_source = backend.health(runtime)
+            healthy = bool(verdict_source.get("healthy"))
+            if is_worker_runtime(runtime.metadata) or not runtime.runtime_url:
+                # No endpoint by design — the health() verdict IS the container.
+                container_running = healthy
+            else:
+                endpoint_healthy = healthy
+        except Exception:
+            logger.exception("liveness probe raised for %s — treating as suspect", runtime.deployment_id)
+            container_running, endpoint_healthy = True, False
+
+        prior = self._liveness_failures.get(runtime.deployment_id, 0)
+        verdict = rank_liveness(
+            container_running=container_running,
+            endpoint_healthy=endpoint_healthy,
+            consecutive_failures=prior,
+        )
+        self._liveness_failures[runtime.deployment_id] = next_failure_count(verdict, prior)
+
+        if verdict == ALIVE:
+            return True
+        if verdict == SUSPECT:
+            logger.warning(
+                "runtime %s endpoint unhealthy (%d consecutive) — not declaring dead yet",
+                runtime.deployment_id, prior + 1,
+            )
+            return True
+
+        logger.error(
+            "runtime %s is DEAD (container_running=%s endpoint_healthy=%s) — "
+            "tearing down and reporting so it can be rebuilt",
+            runtime.deployment_id, container_running, endpoint_healthy,
+        )
+        self._liveness_failures.pop(runtime.deployment_id, None)
+        self._terminate_runtime(runtime, reason="liveness_failed", report=False)
+        try:
+            self.control_plane.update_deployment_status(DeploymentStatusUpdate(
+                deployment_id=runtime.deployment_id,
+                state=DeploymentState.FAILED,
+                error="runtime died after reaching ready (liveness check)",
+            ))
+        except Exception:
+            logger.exception("failed to report liveness failure for %s", runtime.deployment_id)
+        return False
 
     def _terminate_runtime(self, runtime: UnifiedRuntimeRecord, reason: str = "terminated", *, report: bool = True) -> None:
         """Tear down a runtime locally. When `report` is False we DON'T tell the
