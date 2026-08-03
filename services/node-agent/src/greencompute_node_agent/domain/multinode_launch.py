@@ -195,6 +195,35 @@ def docker_ulimit_flags() -> list[str]:
     return ["--ulimit", f"nofile={DISTRIBUTED_NOFILE}"]
 
 
+# Ray's GCS marks a node dead after ~5 missed heartbeats at 3s intervals. On a
+# box whose 8 GPUs are saturated with NCCL traffic the raylet gets starved past
+# that window, GCS declares the node dead, and the raylet then SELF-TERMINATES:
+#   raylet node_manager.cc:476: "GCS consider this node to be dead."
+# For a tightly-coupled replica that is fatal — the executor fails and all 64
+# ranks die ("RuntimeError: Executor failed."), hours into healthy serving, with
+# nothing wrong on the node itself. Observed twice on this fleet (gc-028, gc-027).
+# Widen the window substantially; a genuinely dead node is still caught, just
+# later, and losing a replica is far more expensive than noticing slowly.
+RAY_HEALTH_ENV = {
+    "RAY_health_check_initial_delay_ms": "120000",
+    "RAY_health_check_period_ms": "10000",
+    "RAY_health_check_timeout_ms": "60000",
+    "RAY_health_check_failure_threshold": "20",
+}
+
+
+def docker_ray_health_flags() -> list[str]:
+    """`-e` flags widening Ray's node-liveness window (see RAY_HEALTH_ENV).
+
+    Must be set on EVERY rank: the head runs the GCS that does the judging, the
+    workers run the raylets that get judged.
+    """
+    out: list[str] = []
+    for key, value in RAY_HEALTH_ENV.items():
+        out += ["-e", f"{key}={value}"]
+    return out
+
+
 def build_nic_pin_command(head_host: str) -> str:
     """Shell that pins NCCL/Gloo AND vLLM to the interface on the cluster subnet.
 
@@ -490,6 +519,7 @@ def build_docker_command(
         set_shm_size(strip_port_publish(docker_flags))
         + docker_network_flags()
         + docker_ulimit_flags()
+        + docker_ray_health_flags()
         + ["--entrypoint", "sh"]
     )
     if params.is_head:

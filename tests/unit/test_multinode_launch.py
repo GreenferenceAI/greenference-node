@@ -539,3 +539,35 @@ def test_full_head_command_serves_on_the_host_port():
     assert "--port 41234" in script, "head must listen where the agent probes"
     assert "-p" not in cmd[:cmd.index("img")], "host networking forbids -p"
     assert "--network" in cmd and "host" in cmd
+
+
+# --- Ray node-liveness window (2026-08-03) -----------------------------------
+
+
+def test_every_rank_gets_a_widened_ray_health_window():
+    """Ray's GCS marks a node dead after ~5 missed heartbeats at 3s.
+
+    On a box saturated by 8 GPUs of NCCL the raylet gets starved past that, GCS
+    declares the node dead, and the raylet SELF-TERMINATES
+    ("GCS consider this node to be dead"), failing the executor and killing all
+    64 ranks hours into healthy serving. Killed this fleet twice (gc-028, gc-027).
+    """
+    from greencompute_node_agent.domain.multinode_launch import (
+        MultiNodeParams, build_docker_command, RAY_HEALTH_ENV,
+    )
+    for role, rank in (("head", 0), ("worker", 3)):
+        p = MultiNodeParams(role=role, rank=rank, head_host="10.0.0.1",
+                            tensor_parallel_size=8, pipeline_parallel_size=8,
+                            gpus_per_node=8, node_count=8, replica_id="r")
+        cmd = build_docker_command(docker_flags=["docker", "run", "-d"],
+                                   image="img", serve_argv=["--model", "m"], params=p)
+        joined = " ".join(cmd)
+        for key, value in RAY_HEALTH_ENV.items():
+            assert f"{key}={value}" in joined, f"{role} missing {key}"
+
+
+def test_health_window_is_actually_wider_than_rays_default():
+    from greencompute_node_agent.domain.multinode_launch import RAY_HEALTH_ENV
+    # Ray defaults: period 3000ms, timeout 10000ms, threshold 5.
+    assert int(RAY_HEALTH_ENV["RAY_health_check_failure_threshold"]) > 5
+    assert int(RAY_HEALTH_ENV["RAY_health_check_timeout_ms"]) > 10000
