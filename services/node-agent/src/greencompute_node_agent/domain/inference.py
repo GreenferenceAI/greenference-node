@@ -28,6 +28,7 @@ from greencompute_node_agent.domain.multinode_launch import (
     build_docker_command as build_multi_node_docker_command,
     is_worker_runtime,
     parse_multi_node_params,
+    set_serve_port,
     validate_params,
     worker_health,
 )
@@ -850,7 +851,10 @@ class DockerInferenceBackend(InferenceBackend):
             cmd = build_multi_node_docker_command(
                 docker_flags=cmd[:image_index],
                 image=image,
-                serve_argv=cmd[image_index + 1:],
+                # Host networking means the container port IS the host port, so
+                # the server must listen on the port we publish/probe rather
+                # than the in-container 8000 the single-node path relies on.
+                serve_argv=set_serve_port(cmd[image_index + 1:], port),
                 params=mn_params,
                 vllm_entry=artifact.payload.get("vllm_entry") or DISTRIBUTED_VLLM_ENTRY,
             )

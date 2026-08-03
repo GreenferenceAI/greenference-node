@@ -406,6 +406,28 @@ def worker_health(container_running: bool, backend_name: str = "") -> dict:
     }
 
 
+def set_serve_port(serve_argv: list[str], port: int) -> list[str]:
+    """Point the server's `--port` at the host port the agent will probe.
+
+    Single-node runs publish `-p <host_port>:8000`, so vLLM can hardcode 8000
+    inside the container. A distributed replica uses `--network host` and
+    strip_port_publish() drops that mapping, so the container port IS the host
+    port — leaving it at 8000 means the agent health-probes an ephemeral port
+    nothing listens on, the head NEVER becomes healthy however well it loaded,
+    and it is torn down at the health deadline and rebuilt forever. The gateway
+    endpoint recorded for the replica would be wrong for the same reason.
+    """
+    out = list(serve_argv)
+    for i, arg in enumerate(out):
+        if arg == "--port" and i + 1 < len(out):
+            out[i + 1] = str(port)
+            return out
+        if arg.startswith("--port="):
+            out[i] = f"--port={port}"
+            return out
+    return [*out, "--port", str(port)]
+
+
 def strip_port_publish(docker_flags: list[str]) -> list[str]:
     """Drop `-p host:port:container` pairs.
 

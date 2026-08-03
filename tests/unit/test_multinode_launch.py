@@ -495,3 +495,47 @@ def test_distributed_containers_get_host_ipc():
     namespace; --shm-size alone does not substitute for it."""
     from greencompute_node_agent.domain.multinode_launch import docker_network_flags
     assert "--ipc=host" in docker_network_flags()
+
+
+# --- host networking makes the container port the HOST port (2026-08-03) ------
+
+
+def test_serve_port_is_retargeted_to_the_probed_host_port():
+    """Latent bug: NO agent-managed distributed replica could ever go healthy.
+
+    Single-node publishes `-p <ephemeral>:8000` so vLLM can hardcode 8000.
+    The multi-node rewrite strips that mapping and adds --network host, so the
+    container port IS the host port — but the serve args still said 8000 while
+    runtime_url pointed at the ephemeral port. The head loaded perfectly, never
+    answered on the probed port, and was torn down at the health deadline and
+    rebuilt forever.
+    """
+    from greencompute_node_agent.domain.multinode_launch import set_serve_port
+    assert set_serve_port(["--model", "m", "--host", "0.0.0.0", "--port", "8000"], 41234) == [
+        "--model", "m", "--host", "0.0.0.0", "--port", "41234",
+    ]
+
+
+def test_serve_port_handles_equals_form_and_absence():
+    from greencompute_node_agent.domain.multinode_launch import set_serve_port
+    assert set_serve_port(["--port=8000"], 555) == ["--port=555"]
+    assert set_serve_port(["--model", "m"], 777) == ["--model", "m", "--port", "777"]
+
+
+def test_full_head_command_serves_on_the_host_port():
+    from greencompute_node_agent.domain.multinode_launch import (
+        MultiNodeParams, build_docker_command, set_serve_port,
+    )
+    p = MultiNodeParams(role="head", rank=0, head_host="10.0.0.1",
+                        tensor_parallel_size=8, pipeline_parallel_size=8,
+                        gpus_per_node=8, node_count=8, replica_id="r")
+    cmd = build_docker_command(
+        docker_flags=["docker", "run", "-d", "-p", "127.0.0.1:41234:8000"],
+        image="img",
+        serve_argv=set_serve_port(["--model", "m", "--port", "8000"], 41234),
+        params=p,
+    )
+    script = cmd[-1]
+    assert "--port 41234" in script, "head must listen where the agent probes"
+    assert "-p" not in cmd[:cmd.index("img")], "host networking forbids -p"
+    assert "--network" in cmd and "host" in cmd
